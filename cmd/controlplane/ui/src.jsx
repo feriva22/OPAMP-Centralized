@@ -50,7 +50,7 @@ function App() {
   const filteredAgents = useMemo(() => agents.filter((agent) => {
     const search = query.trim().toLowerCase();
     const matchesSearch = !search || [
-      agent.instance_uid, agent.hostname, agent.os_type, agent.agent_type,
+      agent.instance_uid, agent.hostname, agent.os_type, agent.os_description, agent.agent_type,
       agent.agent_version, agent.source_ip,
     ].some((value) => String(value || '').toLowerCase().includes(search));
     return matchesSearch && (statusFilter === 'all' || agent.connected === (statusFilter === 'connected'));
@@ -292,7 +292,7 @@ function AgentsPage(props) {
           <div class="panel-heading detail-heading"><div><div class="eyebrow">SELECTED INSTANCE</div><h2>{selectedAgent.hostname || shortUID(selectedAgent.instance_uid)}</h2><p class="mono muted">{selectedAgent.instance_uid}</p></div><button class="button button-secondary" onClick={() => onIssueToken(selectedAgent)}>＋ Issue agent token</button></div>
           <div class="agent-facts">
             <Fact label="Connection" value={<Status connected={selectedAgent.connected} />} />
-            <Fact label="Operating system" value={selectedAgent.os_type || '—'} />
+            <Fact label="Operating system" value={<>{selectedAgent.os_description || selectedAgent.os_type || '—'}{selectedAgent.os_description && selectedAgent.os_type && <small class="fact-sub">{selectedAgent.os_type}</small>}</>} />
             <Fact label="Agent version" value={selectedAgent.agent_version || '—'} />
             <Fact label="Agent type" value={selectedAgent.agent_type || '—'} />
             <Fact label="Source IP" value={selectedAgent.source_ip || '—'} />
@@ -313,7 +313,7 @@ function AgentTable({ agents, selectedUID, onSelect, compact = false }) {
     <div class="table-wrap"><table class="data-table"><thead><tr><th>AGENT</th><th>OS / VERSION</th><th>TYPE</th><th>SOURCE IP</th><th>STATUS</th><th>LAST SEEN</th><th>CONFIG</th><th /></tr></thead><tbody>
       {agents.map((agent) => <tr key={agent.instance_uid} class={selectedUID === agent.instance_uid ? 'row-selected' : ''}>
         <td><button class="agent-name" onClick={() => onSelect(agent)}><span class={`agent-avatar ${agent.connected ? 'online' : ''}`}>{(agent.hostname || 'A').slice(0, 1).toUpperCase()}</span><span><strong>{agent.hostname || shortUID(agent.instance_uid)}</strong><small class="mono">{shortUID(agent.instance_uid)}</small></span></button></td>
-        <td><strong class="regular">{agent.os_type || '—'}</strong><small class="cell-sub">{agent.agent_version ? `v${agent.agent_version}` : 'Version unknown'}</small></td>
+        <td><strong class="regular">{agent.os_description || agent.os_type || '—'}</strong><small class="cell-sub">{[agent.os_type, agent.agent_version && `v${agent.agent_version}`].filter(Boolean).join(' · ') || 'OS / version unknown'}</small></td>
         <td>{agent.agent_type || '—'}</td><td class="mono">{agent.source_ip || '—'}</td><td><Status connected={agent.connected} /></td>
         <td>{dateTime(agent.last_seen)}</td><td><span class={`config-status ${agent.desired_config ? 'config-saved' : ''}`}><i />{agent.desired_config ? 'Saved' : 'Not set'}</span></td>
         <td><button class="button button-small" onClick={() => onSelect(agent)}>{compact ? 'Inspect' : selectedUID === agent.instance_uid ? 'Selected' : 'Details'}</button></td>

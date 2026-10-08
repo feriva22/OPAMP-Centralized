@@ -200,12 +200,13 @@ func TestAgentMetadata(t *testing.T) {
 		},
 		NonIdentifyingAttributes: []*protobufs.KeyValue{
 			{Key: "os.type", Value: &protobufs.AnyValue{Value: &protobufs.AnyValue_StringValue{StringValue: "linux"}}},
+			{Key: "os.description", Value: &protobufs.AnyValue{Value: &protobufs.AnyValue_StringValue{StringValue: "Ubuntu 26.04"}}},
 		},
 	}
 
-	hostname, osType, agentType, version := agentMetadata(description)
-	if hostname != "vm-01" || osType != "linux" || agentType != "otelcol-contrib" || version != "0.159.0" {
-		t.Fatalf("agentMetadata() = (%q, %q, %q, %q)", hostname, osType, agentType, version)
+	hostname, osType, osDescription, agentType, version := agentMetadata(description)
+	if hostname != "vm-01" || osType != "linux" || osDescription != "Ubuntu 26.04" || agentType != "otelcol-contrib" || version != "0.159.0" {
+		t.Fatalf("agentMetadata() = (%q, %q, %q, %q, %q)", hostname, osType, osDescription, agentType, version)
 	}
 }
 
@@ -216,6 +217,7 @@ func TestStoredAgentMetadataReadsNonIdentifyingAttributes(t *testing.T) {
 		},
 		NonIdentifyingAttributes: []*protobufs.KeyValue{
 			{Key: "os.type", Value: &protobufs.AnyValue{Value: &protobufs.AnyValue_StringValue{StringValue: "linux"}}},
+			{Key: "os.description", Value: &protobufs.AnyValue{Value: &protobufs.AnyValue_StringValue{StringValue: "Ubuntu 26.04"}}},
 		},
 	}
 	encoded, err := protojson.Marshal(description)
@@ -223,12 +225,12 @@ func TestStoredAgentMetadataReadsNonIdentifyingAttributes(t *testing.T) {
 		t.Fatalf("marshal agent description: %v", err)
 	}
 
-	hostname, osType, _, version, err := storedAgentMetadata(encoded)
+	hostname, osType, osDescription, _, version, err := storedAgentMetadata(encoded)
 	if err != nil {
 		t.Fatalf("storedAgentMetadata(): %v", err)
 	}
-	if hostname != "" || osType != "linux" || version != "0.159.0" {
-		t.Fatalf("storedAgentMetadata() = (%q, %q, %q), want empty hostname, linux, 0.159.0", hostname, osType, version)
+	if hostname != "" || osType != "linux" || osDescription != "Ubuntu 26.04" || version != "0.159.0" {
+		t.Fatalf("storedAgentMetadata() = (%q, %q, %q, %q), want empty hostname, linux, Ubuntu 26.04, 0.159.0", hostname, osType, osDescription, version)
 	}
 }
 

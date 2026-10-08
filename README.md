@@ -39,9 +39,9 @@ To delete the stored staging data as well, run `docker compose down --volumes`.
   desired configs and human-readable effective config files reported by agents.
 - Provides a responsive Admin panel with fleet overview, agent details and
   configuration editor, plus dedicated credential management.
-- Shows agent hostname, OS type, service/type name, version, and source IP when
-  the agent reports those resource attributes and connects directly to the
-  server.
+- Shows agent hostname, OS type and description (for example, Ubuntu 26.04),
+  service/type name, version, and source IP when the agent reports those
+  resource attributes and connects directly to the server.
 - Issues random per-agent bearer tokens, binds bootstrap tokens to the first
   connecting instance UID, stores only token hashes, and supports rotation and
   revocation from the operator UI. Revoking a credential rejects new

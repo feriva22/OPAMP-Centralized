@@ -178,6 +178,7 @@ CREATE TABLE IF NOT EXISTS agents (
     instance_uid BYTEA PRIMARY KEY CHECK (octet_length(instance_uid) = 16),
     hostname TEXT NOT NULL DEFAULT '',
     os_type TEXT NOT NULL DEFAULT '',
+    os_description TEXT NOT NULL DEFAULT '',
     agent_type TEXT NOT NULL DEFAULT '',
     agent_version TEXT NOT NULL DEFAULT '',
     source_ip TEXT NOT NULL DEFAULT '',
@@ -192,6 +193,7 @@ CREATE TABLE IF NOT EXISTS agents (
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS reported_config_files JSONB NOT NULL DEFAULT '{}'::jsonb;
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS hostname TEXT NOT NULL DEFAULT '';
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS os_type TEXT NOT NULL DEFAULT '';
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS os_description TEXT NOT NULL DEFAULT '';
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS agent_type TEXT NOT NULL DEFAULT '';
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS agent_version TEXT NOT NULL DEFAULT '';
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS source_ip TEXT NOT NULL DEFAULT '';
@@ -410,38 +412,39 @@ func (cp *controlPlane) saveStatus(ctx context.Context, conn types.Connection, m
 	if err != nil {
 		return fmt.Errorf("marshal reported config files: %w", err)
 	}
-	hostname, osType, agentType, agentVersion := agentMetadata(message.GetAgentDescription())
+	hostname, osType, osDescription, agentType, agentVersion := agentMetadata(message.GetAgentDescription())
 	sourceIP := connectionSourceIP(conn)
 	_, err = cp.db.Exec(ctx, `
 INSERT INTO agents (
-    instance_uid, hostname, os_type, agent_type, agent_version, source_ip,
+    instance_uid, hostname, os_type, os_description, agent_type, agent_version, source_ip,
     agent_description, health, effective_config, reported_config_files, remote_config_status, connected, last_seen
-) VALUES ($1, COALESCE($2, ''), COALESCE($3, ''), COALESCE($4, ''), COALESCE($5, ''), COALESCE($6, ''),
-          COALESCE($7::jsonb, '{}'::jsonb), COALESCE($8::jsonb, '{}'::jsonb),
-          COALESCE($9::jsonb, '{}'::jsonb), COALESCE($10::jsonb, '{}'::jsonb),
-          COALESCE($11::jsonb, '{}'::jsonb), TRUE, NOW())
+) VALUES ($1, COALESCE($2, ''), COALESCE($3, ''), COALESCE($4, ''), COALESCE($5, ''), COALESCE($6, ''), COALESCE($7, ''),
+          COALESCE($8::jsonb, '{}'::jsonb), COALESCE($9::jsonb, '{}'::jsonb),
+          COALESCE($10::jsonb, '{}'::jsonb), COALESCE($11::jsonb, '{}'::jsonb),
+          COALESCE($12::jsonb, '{}'::jsonb), TRUE, NOW())
 ON CONFLICT (instance_uid) DO UPDATE SET
     hostname = COALESCE(NULLIF($2, ''), agents.hostname),
     os_type = COALESCE(NULLIF($3, ''), agents.os_type),
-    agent_type = COALESCE(NULLIF($4, ''), agents.agent_type),
-    agent_version = COALESCE(NULLIF($5, ''), agents.agent_version),
-    source_ip = COALESCE(NULLIF($6, ''), agents.source_ip),
-    agent_description = COALESCE($7::jsonb, agents.agent_description),
-    health = COALESCE($8::jsonb, agents.health),
-    effective_config = COALESCE($9::jsonb, agents.effective_config),
-    reported_config_files = COALESCE($10::jsonb, agents.reported_config_files),
-    remote_config_status = COALESCE($11::jsonb, agents.remote_config_status),
+    os_description = COALESCE(NULLIF($4, ''), agents.os_description),
+    agent_type = COALESCE(NULLIF($5, ''), agents.agent_type),
+    agent_version = COALESCE(NULLIF($6, ''), agents.agent_version),
+    source_ip = COALESCE(NULLIF($7, ''), agents.source_ip),
+    agent_description = COALESCE($8::jsonb, agents.agent_description),
+    health = COALESCE($9::jsonb, agents.health),
+    effective_config = COALESCE($10::jsonb, agents.effective_config),
+    reported_config_files = COALESCE($11::jsonb, agents.reported_config_files),
+    remote_config_status = COALESCE($12::jsonb, agents.remote_config_status),
     connected = TRUE,
     last_seen = NOW()`,
-		message.GetInstanceUid(), nullableString(hostname), nullableString(osType),
+		message.GetInstanceUid(), nullableString(hostname), nullableString(osType), nullableString(osDescription),
 		nullableString(agentType), nullableString(agentVersion), nullableString(sourceIP),
 		description, health, effectiveConfig, reportedConfigFiles, configStatus)
 	return err
 }
 
-func agentMetadata(description *protobufs.AgentDescription) (hostname, osType, agentType, version string) {
+func agentMetadata(description *protobufs.AgentDescription) (hostname, osType, osDescription, agentType, version string) {
 	if description == nil {
-		return "", "", "", ""
+		return "", "", "", "", ""
 	}
 	for _, attributes := range [][]*protobufs.KeyValue{
 		description.GetIdentifyingAttributes(),
@@ -461,6 +464,10 @@ func agentMetadata(description *protobufs.AgentDescription) (hostname, osType, a
 				if osType == "" {
 					osType = value
 				}
+			case "os.description":
+				if osDescription == "" {
+					osDescription = value
+				}
 			case "service.name":
 				if agentType == "" {
 					agentType = value
@@ -472,16 +479,16 @@ func agentMetadata(description *protobufs.AgentDescription) (hostname, osType, a
 			}
 		}
 	}
-	return hostname, osType, agentType, version
+	return hostname, osType, osDescription, agentType, version
 }
 
-func storedAgentMetadata(descriptionJSON []byte) (hostname, osType, agentType, version string, err error) {
+func storedAgentMetadata(descriptionJSON []byte) (hostname, osType, osDescription, agentType, version string, err error) {
 	description := &protobufs.AgentDescription{}
 	if err := protojson.Unmarshal(descriptionJSON, description); err != nil {
-		return "", "", "", "", err
+		return "", "", "", "", "", err
 	}
-	hostname, osType, agentType, version = agentMetadata(description)
-	return hostname, osType, agentType, version, nil
+	hostname, osType, osDescription, agentType, version = agentMetadata(description)
+	return hostname, osType, osDescription, agentType, version, nil
 }
 
 func connectionSourceIP(conn types.Connection) string {
@@ -658,7 +665,8 @@ func (cp *controlPlane) listAgents(w http.ResponseWriter, r *http.Request) {
 	rows, err := cp.db.Query(r.Context(), `
 SELECT encode(a.instance_uid, 'hex'), a.agent_description, a.health, a.effective_config,
        a.reported_config_files, a.remote_config_status, a.connected, a.last_seen,
-       COALESCE(c.config, ''), a.hostname, a.os_type, a.agent_type, a.agent_version, a.source_ip
+       COALESCE(c.config, ''), a.hostname, a.os_type, a.os_description,
+       a.agent_type, a.agent_version, a.source_ip
 FROM agents a
 LEFT JOIN agent_configs c ON c.instance_uid = a.instance_uid
 ORDER BY a.last_seen DESC`)
@@ -681,6 +689,7 @@ ORDER BY a.last_seen DESC`)
 		DesiredConfig       string          `json:"desired_config"`
 		Hostname            string          `json:"hostname"`
 		OSType              string          `json:"os_type"`
+		OSDescription       string          `json:"os_description"`
 		AgentType           string          `json:"agent_type"`
 		AgentVersion        string          `json:"agent_version"`
 		SourceIP            string          `json:"source_ip"`
@@ -688,13 +697,13 @@ ORDER BY a.last_seen DESC`)
 	agents := make([]agent, 0)
 	for rows.Next() {
 		var item agent
-		if err := rows.Scan(&item.InstanceUID, &item.AgentDescription, &item.Health, &item.EffectiveConfig, &item.ReportedConfigFiles, &item.RemoteConfigStatus, &item.Connected, &item.LastSeen, &item.DesiredConfig, &item.Hostname, &item.OSType, &item.AgentType, &item.AgentVersion, &item.SourceIP); err != nil {
+		if err := rows.Scan(&item.InstanceUID, &item.AgentDescription, &item.Health, &item.EffectiveConfig, &item.ReportedConfigFiles, &item.RemoteConfigStatus, &item.Connected, &item.LastSeen, &item.DesiredConfig, &item.Hostname, &item.OSType, &item.OSDescription, &item.AgentType, &item.AgentVersion, &item.SourceIP); err != nil {
 			http.Error(w, "could not read agent records", http.StatusInternalServerError)
 			cp.logger.Printf("scan agent record: %v", err)
 			return
 		}
-		if item.Hostname == "" || item.OSType == "" || item.AgentType == "" || item.AgentVersion == "" {
-			hostname, osType, agentType, version, err := storedAgentMetadata(item.AgentDescription)
+		if item.Hostname == "" || item.OSType == "" || item.OSDescription == "" || item.AgentType == "" || item.AgentVersion == "" {
+			hostname, osType, osDescription, agentType, version, err := storedAgentMetadata(item.AgentDescription)
 			if err != nil {
 				http.Error(w, "could not read agent metadata", http.StatusInternalServerError)
 				cp.logger.Printf("decode stored agent description for %s: %v", item.InstanceUID, err)
@@ -705,6 +714,9 @@ ORDER BY a.last_seen DESC`)
 			}
 			if item.OSType == "" {
 				item.OSType = osType
+			}
+			if item.OSDescription == "" {
+				item.OSDescription = osDescription
 			}
 			if item.AgentType == "" {
 				item.AgentType = agentType
