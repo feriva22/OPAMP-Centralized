@@ -1,5 +1,6 @@
 import { render } from 'preact';
 import { useEffect, useMemo, useState } from 'preact/hooks';
+import { parse as parseYAML } from 'yaml';
 import './style.css';
 
 const icons = {
@@ -298,9 +299,10 @@ function AgentsPage(props) {
             <Fact label="Source IP" value={selectedAgent.source_ip || '—'} />
             <Fact label="Last seen" value={dateTime(selectedAgent.last_seen)} />
           </div>
-          <div class="tabs"><button class={configTab === 'desired' ? 'selected' : ''} onClick={() => setConfigTab('desired')}>Desired config</button><button class={configTab === 'reported' ? 'selected' : ''} onClick={() => setConfigTab('reported')}>Effective config</button><button class={configTab === 'health' ? 'selected' : ''} onClick={() => setConfigTab('health')}>Health & status</button></div>
+          <div class="tabs"><button class={configTab === 'desired' ? 'selected' : ''} onClick={() => setConfigTab('desired')}>Desired config</button><button class={configTab === 'reported' ? 'selected' : ''} onClick={() => setConfigTab('reported')}>Effective config</button><button class={configTab === 'pipeline' ? 'selected' : ''} onClick={() => setConfigTab('pipeline')}>Pipeline</button><button class={configTab === 'health' ? 'selected' : ''} onClick={() => setConfigTab('health')}>Health & status</button></div>
           {configTab === 'desired' && <div class="config-editor"><div class="config-label"><div><strong>Collector YAML</strong><small>Saved configuration is offered to the agent on its next status report.</small></div><button class="button button-primary" disabled={savingConfig} onClick={onSaveConfig}>{savingConfig ? 'Saving…' : 'Save desired config'}</button></div><textarea spellcheck="false" value={config} onInput={(event) => setConfig(event.currentTarget.value)} placeholder={'receivers:\n  otlp:\n    protocols:\n      grpc:\n'} /></div>}
           {configTab === 'reported' && <ReportedConfig files={selectedAgent.reported_config_files} />}
+          {configTab === 'pipeline' && <PipelineView files={selectedAgent.reported_config_files} />}
           {configTab === 'health' && <div class="json-panels"><JsonPanel title="Agent health" value={selectedAgent.health} /><JsonPanel title="Remote config status" value={selectedAgent.remote_config_status} /></div>}
         </section>
       )}
@@ -334,6 +336,86 @@ function ReportedConfig({ files }) {
   const entries = Object.entries(files || {});
   if (!entries.length) return <div class="empty-inline">No effective config has been reported by this agent yet.</div>;
   return <div class="reported-config">{entries.map(([name, content]) => <div class="reported-file" key={name}><div class="file-label"><span>▤</span>{name || 'collector.yaml'}</div><pre>{content}</pre></div>)}</div>;
+}
+
+function PipelineView({ files }) {
+  const entries = Object.entries(files || {}).filter(([, content]) => typeof content === 'string' && content.trim());
+  const [selectedFile, setSelectedFile] = useState(entries[0]?.[0] || '');
+  useEffect(() => {
+    if (!entries.some(([name]) => name === selectedFile)) setSelectedFile(entries[0]?.[0] || '');
+  }, [files, selectedFile]);
+
+  if (!entries.length) {
+    return <div class="empty-inline">No effective config has been reported by this agent yet. The pipeline view uses the agent-reported effective config.</div>;
+  }
+
+  const content = entries.find(([name]) => name === selectedFile)?.[1] || '';
+  let config;
+  try {
+    config = parseYAML(content);
+  } catch (cause) {
+    return <div class="pipeline-error"><strong>Could not parse this agent config</strong><span>{cause.message}</span></div>;
+  }
+
+  const pipelines = config?.service?.pipelines;
+  if (!pipelines || typeof pipelines !== 'object' || Array.isArray(pipelines) || !Object.keys(pipelines).length) {
+    return <div class="pipeline-view">
+      <PipelineFileSelect entries={entries} selectedFile={selectedFile} onChange={setSelectedFile} />
+      <div class="empty-inline">This config does not define any <code>service.pipelines</code>.</div>
+    </div>;
+  }
+
+  return (
+    <div class="pipeline-view">
+      <div class="pipeline-toolbar">
+        <div><strong>Agent-reported pipelines</strong><small>Built from the effective configuration reported by the agent.</small></div>
+        <PipelineFileSelect entries={entries} selectedFile={selectedFile} onChange={setSelectedFile} />
+      </div>
+      <div class="pipeline-list">
+        {Object.entries(pipelines).map(([name, pipeline]) => (
+          <PipelineDiagram key={name} name={name} pipeline={pipeline} />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function PipelineFileSelect({ entries, selectedFile, onChange }) {
+  if (entries.length < 2) return null;
+  return <label class="pipeline-file-select">Config file<select value={selectedFile} onChange={(event) => onChange(event.currentTarget.value)}>{entries.map(([name]) => <option key={name} value={name}>{name || 'collector.yaml'}</option>)}</select></label>;
+}
+
+function PipelineDiagram({ name, pipeline }) {
+  const stages = [
+    { title: 'Receivers', kind: 'receiver', values: normalizeComponentRefs(pipeline?.receivers) },
+    { title: 'Processors', kind: 'processor', values: normalizeComponentRefs(pipeline?.processors) },
+    { title: 'Exporters', kind: 'exporter', values: normalizeComponentRefs(pipeline?.exporters) },
+  ];
+
+  return (
+    <section class="pipeline-card">
+      <div class="pipeline-title"><span class="pipeline-signal">{name.split('/')[0]}</span><strong>{name}</strong></div>
+      <div class="pipeline-flow">
+        {stages.map((stage, index) => (
+          <div class="pipeline-flow-part" key={stage.kind}>
+            {index > 0 && <span class="pipeline-arrow" aria-hidden="true">→</span>}
+            <div class="pipeline-stage">
+              <div class="pipeline-stage-title">{stage.title}<span>{stage.values.length}</span></div>
+              {stage.values.length
+                ? stage.values.map((value) => <div class={`pipeline-component ${stage.kind}`} key={value}>{value}</div>)
+                : <div class="pipeline-none">{stage.kind === 'processor' ? 'No processors' : `No ${stage.title.toLowerCase()}`}</div>}
+            </div>
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function normalizeComponentRefs(value) {
+  if (typeof value === 'string') return [value];
+  if (!Array.isArray(value)) return [];
+  return value.filter((item) => typeof item === 'string');
 }
 
 function JsonPanel({ title, value }) {
