@@ -31,6 +31,33 @@ expose either HTTP service to an untrusted network.
 Stop the services with `docker compose down`. This retains the database volume.
 To delete the stored staging data as well, run `docker compose down --volumes`.
 
+## GitHub Actions image publishing
+
+The workflow at `.github/workflows/publish-image.yml` builds the multi-stage
+image and publishes it to GitHub Container Registry as
+`ghcr.io/<owner>/<repository>`. It runs on branch pushes, `v*` tags, and
+pull requests. Pull requests build the image for verification without
+publishing it. The default branch also receives the `latest` tag; branch and
+version tags are published by their corresponding pushes. Images also receive
+a commit-SHA tag.
+
+No registry password setup is required: the workflow uses the built-in
+`GITHUB_TOKEN`. Ensure repository Actions are enabled and the workflow has
+permission to write packages. The package can be made public from its GitHub
+Packages settings if it should be pullable without authentication.
+
+To run a published image with Compose, set `OPAMP_IMAGE` to the desired GHCR
+tag (for example `ghcr.io/<owner>/<repository>:latest`) in the environment or
+`.env`, then run:
+
+```powershell
+docker compose pull opamp-server
+docker compose up -d --no-build opamp-server
+```
+
+The default Compose behavior remains a local source build tagged
+`opamp-control-plane:local`.
+
 ## Features
 
 - Persists agent UID, description, health, effective config, remote-config

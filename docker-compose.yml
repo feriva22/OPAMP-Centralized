@@ -1,5 +1,6 @@
 services:
   opamp-server:
+    image: ${OPAMP_IMAGE:-opamp-control-plane:local}
     build:
       context: .
     environment:
