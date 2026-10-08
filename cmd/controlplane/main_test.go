@@ -5,11 +5,48 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"strings"
 	"testing"
 
 	"github.com/open-telemetry/opamp-go/protobufs"
 )
+
+func TestAdminUIIsEmbeddedAndProtected(t *testing.T) {
+	handler := (&controlPlane{}).adminHandler("operator", "a-long-staging-password")
+
+	unauthorized := httptest.NewRecorder()
+	handler.ServeHTTP(unauthorized, httptest.NewRequest(http.MethodGet, "/", nil))
+	if unauthorized.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated status = %d, want %d", unauthorized.Code, http.StatusUnauthorized)
+	}
+
+	request := httptest.NewRequest(http.MethodGet, "/", nil)
+	request.SetBasicAuth("operator", "a-long-staging-password")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("authenticated status = %d, want %d", response.Code, http.StatusOK)
+	}
+	if got := response.Header().Get("Content-Type"); got != "text/html; charset=utf-8" {
+		t.Fatalf("Content-Type = %q, want HTML", got)
+	}
+	assetPath := regexp.MustCompile(`src="/assets/([^"]+\.js)"`).FindStringSubmatch(response.Body.String())
+	if len(assetPath) != 2 {
+		t.Fatal("embedded admin page does not reference a built JavaScript asset")
+	}
+
+	assetRequest := httptest.NewRequest(http.MethodGet, "/assets/"+assetPath[1], nil)
+	assetRequest.SetBasicAuth("operator", "a-long-staging-password")
+	assetResponse := httptest.NewRecorder()
+	handler.ServeHTTP(assetResponse, assetRequest)
+	if assetResponse.Code != http.StatusOK {
+		t.Fatalf("asset status = %d, want %d", assetResponse.Code, http.StatusOK)
+	}
+	if assetResponse.Body.Len() == 0 {
+		t.Fatal("embedded JavaScript asset is empty")
+	}
+}
 
 func TestBasicAuth(t *testing.T) {
 	handler := basicAuth("operator", "a-long-staging-password", http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {

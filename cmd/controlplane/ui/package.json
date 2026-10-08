@@ -1,0 +1,16 @@
+{
+  "name": "opamp-control-plane-admin",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "build": "vite build"
+  },
+  "dependencies": {
+    "preact": "^10.26.4"
+  },
+  "devDependencies": {
+    "@preact/preset-vite": "^2.10.1",
+    "vite": "^6.2.0"
+  }
+}

@@ -577,6 +577,13 @@ func (cp *controlPlane) desiredConfig(ctx context.Context, instanceUID []byte) (
 
 func (cp *controlPlane) adminHandler(username, password string) http.Handler {
 	mux := http.NewServeMux()
+	assets, err := adminUIAssetsHandler()
+	if err != nil {
+		cp.logger.Printf("load admin UI assets: %v", err)
+		assets = http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			http.Error(w, "admin UI assets are unavailable", http.StatusInternalServerError)
+		})
+	}
 	healthHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
 		defer cancel()
@@ -587,7 +594,8 @@ func (cp *controlPlane) adminHandler(username, password string) http.Handler {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok\n"))
 	})
-	mux.HandleFunc("GET /", cp.adminPage)
+	mux.Handle("GET /assets/", assets)
+	mux.HandleFunc("GET /", serveAdminUI)
 	mux.HandleFunc("GET /api/v1/agents", cp.listAgents)
 	mux.HandleFunc("PUT /api/v1/agents/{uid}/config", cp.putConfig)
 	mux.HandleFunc("GET /api/v1/agents/{uid}/config", cp.getConfig)
@@ -624,56 +632,6 @@ func basicAuth(username, password string, next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
-}
-
-func (cp *controlPlane) adminPage(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path != "/" {
-		http.NotFound(w, r)
-		return
-	}
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	_, _ = w.Write([]byte(`<!doctype html>
-<html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width">
-<title>OpAMP Control Plane</title>
-<style>body{font:16px system-ui;max-width:1400px;margin:2rem auto;padding:0 1rem}textarea{box-sizing:border-box;width:100%;height:16rem;font:14px monospace}table{border-collapse:collapse;width:100%;display:block;overflow-x:auto}td,th{padding:.5rem;border:1px solid #ccc;text-align:left;white-space:nowrap}button{padding:.5rem;cursor:pointer}pre{white-space:pre-wrap;overflow-wrap:anywhere}.config-view{min-height:8rem;padding:1rem;background:#f4f4f4;border:1px solid #ccc}</style>
-<h1>OpAMP Control Plane (staging)</h1>
-<p>Agents require individual bearer tokens. The current OpAMP endpoint uses plaintext <code>ws://</code>; tokens can be intercepted on the network. Use only on a trusted, isolated staging network.</p>
-<button onclick="refreshAll()">Refresh</button><p id="error" role="alert"></p>
-<h2>Agent credentials</h2>
-<label>Bootstrap token label <input id="token-name" maxlength="100" value="Linux VM bootstrap"></label>
-<button onclick="createBootstrapToken()">Create bootstrap token</button>
-<p>Create a bootstrap token before installing an agent. It binds to the first agent UID that connects and cannot be reused by another UID.</p>
-<table><thead><tr><th>Label</th><th>Bound instance UID</th><th>Status</th><th>Created</th><th>Last used</th><th>Actions</th></tr></thead><tbody id="tokens"></tbody></table>
-<section id="new-token" hidden><h3>Copy this token now</h3><p>The plaintext is shown only once. Store it securely; the server keeps only its hash.</p><pre id="token-value"></pre><p>Linux install command (the installer prompts for the token):</p><pre id="install-command"></pre><button onclick="hideToken()">Hide token</button></section>
-<h2>Agents</h2>
-<table><thead><tr><th>Instance UID</th><th>Hostname</th><th>OS</th><th>Agent type</th><th>Version</th><th>Source IP</th><th>Connected</th><th>Last seen</th><th>Desired config</th><th>Reported config</th><th></th></tr></thead><tbody id="agents"></tbody></table>
-<h2>Selected agent</h2>
-<label>Agent instance UID<input id="uid" readonly style="display:block;width:100%"></label>
-<h3>Desired Collector YAML (editable)</h3>
-<textarea id="config" spellcheck="false"></textarea>
-<button onclick="saveConfig()">Save configuration</button>
-<h3>Effective config reported by agent</h3>
-<pre id="reported" class="config-view">Select an agent to inspect its reported effective config.</pre>
-<script>
-const agentsBody=document.querySelector('#agents');
-const tokensBody=document.querySelector('#tokens');
-const errorBox=document.querySelector('#error');
-let agentsByUID=new Map();
-function cell(row,value){const td=document.createElement('td');td.textContent=value;row.appendChild(td);return td}
-async function api(url,options){const r=await fetch(url,options);const body=await r.text();if(!r.ok)throw Error(body||'Request failed');return body?JSON.parse(body):null}
-function showNewToken(result){document.querySelector('#token-value').textContent=result.token;const endpoint='ws://'+location.hostname+':4320/v1/opamp';document.querySelector('#install-command').textContent='sudo bash ./install-agent.sh "'+endpoint+'"';document.querySelector('#new-token').hidden=false;document.querySelector('#new-token').scrollIntoView({behavior:'smooth'})}
-function hideToken(){document.querySelector('#token-value').textContent='';document.querySelector('#install-command').textContent='';document.querySelector('#new-token').hidden=true}
-function selectAgent(uid){const agent=agentsByUID.get(uid);if(!agent)return;document.querySelector('#uid').value=uid;document.querySelector('#config').value=agent.desired_config||'';const files=agent.reported_config_files||{};const entries=Object.entries(files);document.querySelector('#reported').textContent=entries.length?entries.map(([name,content])=>(name?'# '+name+'\n':'')+content).join('\n\n'):'No effective config reported yet. Confirm the Supervisor has reports_effective_config enabled and refresh after it sends a status update.'}
-async function loadAgents(){const agents=await api('/api/v1/agents');agentsByUID=new Map(agents.map(agent=>[agent.instance_uid,agent]));agentsBody.replaceChildren();for(const agent of agents){const row=document.createElement('tr');cell(row,agent.instance_uid);cell(row,agent.hostname);cell(row,agent.os_type);cell(row,agent.agent_type);cell(row,agent.agent_version);cell(row,agent.source_ip);cell(row,agent.connected?'Yes':'No');cell(row,new Date(agent.last_seen).toLocaleString());cell(row,agent.desired_config?'Saved':'Not set');cell(row,Object.keys(agent.reported_config_files||{}).length?'Available':'Not reported');const action=cell(row,'');const button=document.createElement('button');button.textContent='View / edit';button.onclick=()=>selectAgent(agent.instance_uid);action.appendChild(button);const tokenButton=document.createElement('button');tokenButton.textContent='Issue token';tokenButton.onclick=()=>issueAgentToken(agent.instance_uid,agent.hostname);action.appendChild(document.createTextNode(' '));action.appendChild(tokenButton);agentsBody.appendChild(row)}const uid=document.querySelector('#uid').value;if(uid)selectAgent(uid)}
-async function loadTokens(){const tokens=await api('/api/v1/agent-tokens');tokensBody.replaceChildren();for(const token of tokens){const row=document.createElement('tr');cell(row,token.name);cell(row,token.instance_uid||'Unbound (awaiting first connection)');cell(row,token.revoked_at?'Revoked':'Active');cell(row,new Date(token.created_at).toLocaleString());cell(row,token.last_used_at?new Date(token.last_used_at).toLocaleString():'Never');const action=cell(row,'');if(!token.revoked_at){const rotate=document.createElement('button');rotate.textContent='Rotate';rotate.onclick=()=>rotateToken(token.id);action.appendChild(rotate);const revoke=document.createElement('button');revoke.textContent='Revoke';revoke.onclick=()=>revokeToken(token.id);action.appendChild(document.createTextNode(' '));action.appendChild(revoke)}tokensBody.appendChild(row)}}
-async function refreshAll(){try{errorBox.textContent='';await Promise.all([loadAgents(),loadTokens()])}catch(e){errorBox.textContent=e.message}}
-async function createBootstrapToken(){try{const result=await api('/api/v1/agent-tokens',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:document.querySelector('#token-name').value})});showNewToken(result);await refreshAll()}catch(e){errorBox.textContent=e.message}}
-async function issueAgentToken(uid,hostname){try{const result=await api('/api/v1/agents/'+encodeURIComponent(uid)+'/token',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:'Agent '+(hostname||uid)})});showNewToken(result);await refreshAll()}catch(e){errorBox.textContent=e.message}}
-async function rotateToken(id){if(!confirm('Revoke this token and issue its replacement? The current connection will be disconnected.'))return;try{const result=await api('/api/v1/agent-tokens/'+id+'/rotate',{method:'POST'});showNewToken(result);await refreshAll()}catch(e){errorBox.textContent=e.message}}
-async function revokeToken(id){if(!confirm('Revoke this token and disconnect its active agent?'))return;try{await api('/api/v1/agent-tokens/'+id,{method:'DELETE'});hideToken();await refreshAll()}catch(e){errorBox.textContent=e.message}}
-async function saveConfig(){try{const uid=document.querySelector('#uid').value.trim();if(!uid)throw Error('Select an agent first.');const config=document.querySelector('#config').value;const r=await fetch('/api/v1/agents/'+encodeURIComponent(uid)+'/config',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({config})});const body=await r.text();if(!r.ok)throw Error(body);await loadAgents();alert("Configuration saved. It will be offered on the agent's next status report.")}catch(e){errorBox.textContent=e.message}}
-refreshAll();
-</script></html>`))
 }
 
 func (cp *controlPlane) listAgents(w http.ResponseWriter, r *http.Request) {

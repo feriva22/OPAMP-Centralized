@@ -20,7 +20,8 @@ networks**.
    ```
 
 4. Open <http://localhost:4321>. The browser prompts for the operator Basic
-   Auth credentials.
+   Auth credentials. This serves the Preact-based Admin panel embedded in the
+   control-plane binary; no separate frontend service is needed.
 
 The OpAMP endpoint is `ws://localhost:4320/v1/opamp`. Both ports are published
 according to the bindings in `docker-compose.yml`; PostgreSQL has no published
@@ -36,6 +37,8 @@ To delete the stored staging data as well, run `docker compose down --volumes`.
   status, and last-seen/connected state in PostgreSQL.
 - Lists agents in the Basic-Auth-protected UI and JSON API, including saved
   desired configs and human-readable effective config files reported by agents.
+- Provides a responsive Admin panel with fleet overview, agent details and
+  configuration editor, plus dedicated credential management.
 - Shows agent hostname, OS type, service/type name, version, and source IP when
   the agent reports those resource attributes and connects directly to the
   server.
@@ -139,3 +142,16 @@ application must still be extended and security-reviewed:
 
 Putting the service behind a TLS proxy does not enable TLS on its OpAMP
 listener; use a secure `wss://` endpoint for production agents.
+
+## Admin panel frontend development
+
+Frontend source is in `cmd/controlplane/ui`. To build its static bundle locally:
+
+```powershell
+cd cmd\controlplane\ui
+npm ci
+npm run build
+```
+
+The Go server embeds `cmd/controlplane/ui/dist`, and the Docker build compiles
+the frontend before building the server image.
