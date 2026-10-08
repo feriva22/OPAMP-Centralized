@@ -1,0 +1,21 @@
+server:
+  endpoint: "__OPAMP_ENDPOINT__"
+
+capabilities:
+  reports_effective_config: true
+  reports_own_metrics: true
+  reports_own_logs: true
+  reports_own_traces: false
+  reports_health: true
+  accepts_remote_config: true
+
+agent:
+  executable: /opt/opamp/bin/otelcol-contrib
+  config_files:
+    - /etc/opamp/collector.yaml
+  validate_config: true
+  automatic_config_rollback: true
+  passthrough_logs: true
+
+storage:
+  directory: /var/lib/opamp/supervisor

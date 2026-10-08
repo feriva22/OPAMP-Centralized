@@ -1,0 +1,59 @@
+services:
+  opamp-server:
+    build:
+      context: .
+    environment:
+      DATABASE_URL: postgres://opamp:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/opamp?sslmode=disable
+      OPAMP_ADMIN_USERNAME: ${OPAMP_ADMIN_USERNAME:?Set OPAMP_ADMIN_USERNAME in .env}
+      OPAMP_ADMIN_PASSWORD: ${OPAMP_ADMIN_PASSWORD:?Set OPAMP_ADMIN_PASSWORD in .env}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "4320:4320"
+      - "4321:4321"
+    networks:
+      - control-plane
+      - database
+    restart: unless-stopped
+    read_only: true
+    healthcheck:
+      test: ["CMD", "/opamp-control-plane", "healthcheck"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: opamp
+      POSTGRES_USER: opamp
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - database
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U opamp -d opamp"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+
+networks:
+  control-plane:
+    driver: bridge
+  database:
+    internal: true
+
+volumes:
+  postgres_data:
