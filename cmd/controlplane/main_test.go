@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/open-telemetry/opamp-go/protobufs"
+	"google.golang.org/protobuf/encoding/protojson"
 )
 
 func TestAdminUIIsEmbeddedAndProtected(t *testing.T) {
@@ -194,15 +195,40 @@ func TestAgentMetadata(t *testing.T) {
 	description := &protobufs.AgentDescription{
 		IdentifyingAttributes: []*protobufs.KeyValue{
 			{Key: "host.name", Value: &protobufs.AnyValue{Value: &protobufs.AnyValue_StringValue{StringValue: "vm-01"}}},
-			{Key: "os.type", Value: &protobufs.AnyValue{Value: &protobufs.AnyValue_StringValue{StringValue: "linux"}}},
 			{Key: "service.name", Value: &protobufs.AnyValue{Value: &protobufs.AnyValue_StringValue{StringValue: "otelcol-contrib"}}},
 			{Key: "service.version", Value: &protobufs.AnyValue{Value: &protobufs.AnyValue_StringValue{StringValue: "0.159.0"}}},
+		},
+		NonIdentifyingAttributes: []*protobufs.KeyValue{
+			{Key: "os.type", Value: &protobufs.AnyValue{Value: &protobufs.AnyValue_StringValue{StringValue: "linux"}}},
 		},
 	}
 
 	hostname, osType, agentType, version := agentMetadata(description)
 	if hostname != "vm-01" || osType != "linux" || agentType != "otelcol-contrib" || version != "0.159.0" {
 		t.Fatalf("agentMetadata() = (%q, %q, %q, %q)", hostname, osType, agentType, version)
+	}
+}
+
+func TestStoredAgentMetadataReadsNonIdentifyingAttributes(t *testing.T) {
+	description := &protobufs.AgentDescription{
+		IdentifyingAttributes: []*protobufs.KeyValue{
+			{Key: "service.version", Value: &protobufs.AnyValue{Value: &protobufs.AnyValue_StringValue{StringValue: "0.159.0"}}},
+		},
+		NonIdentifyingAttributes: []*protobufs.KeyValue{
+			{Key: "os.type", Value: &protobufs.AnyValue{Value: &protobufs.AnyValue_StringValue{StringValue: "linux"}}},
+		},
+	}
+	encoded, err := protojson.Marshal(description)
+	if err != nil {
+		t.Fatalf("marshal agent description: %v", err)
+	}
+
+	hostname, osType, _, version, err := storedAgentMetadata(encoded)
+	if err != nil {
+		t.Fatalf("storedAgentMetadata(): %v", err)
+	}
+	if hostname != "" || osType != "linux" || version != "0.159.0" {
+		t.Fatalf("storedAgentMetadata() = (%q, %q, %q), want empty hostname, linux, 0.159.0", hostname, osType, version)
 	}
 }
 

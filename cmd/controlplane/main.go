@@ -443,25 +443,45 @@ func agentMetadata(description *protobufs.AgentDescription) (hostname, osType, a
 	if description == nil {
 		return "", "", "", ""
 	}
-	for _, attribute := range description.GetIdentifyingAttributes() {
-		if attribute == nil || attribute.GetValue() == nil {
-			continue
-		}
-		value := attribute.GetValue().GetStringValue()
-		switch attribute.GetKey() {
-		case "host.name", "host.hostname":
-			if hostname == "" {
-				hostname = value
+	for _, attributes := range [][]*protobufs.KeyValue{
+		description.GetIdentifyingAttributes(),
+		description.GetNonIdentifyingAttributes(),
+	} {
+		for _, attribute := range attributes {
+			if attribute == nil || attribute.GetValue() == nil {
+				continue
 			}
-		case "os.type":
-			osType = value
-		case "service.name":
-			agentType = value
-		case "service.version":
-			version = value
+			value := attribute.GetValue().GetStringValue()
+			switch attribute.GetKey() {
+			case "host.name", "host.hostname":
+				if hostname == "" {
+					hostname = value
+				}
+			case "os.type":
+				if osType == "" {
+					osType = value
+				}
+			case "service.name":
+				if agentType == "" {
+					agentType = value
+				}
+			case "service.version":
+				if version == "" {
+					version = value
+				}
+			}
 		}
 	}
 	return hostname, osType, agentType, version
+}
+
+func storedAgentMetadata(descriptionJSON []byte) (hostname, osType, agentType, version string, err error) {
+	description := &protobufs.AgentDescription{}
+	if err := protojson.Unmarshal(descriptionJSON, description); err != nil {
+		return "", "", "", "", err
+	}
+	hostname, osType, agentType, version = agentMetadata(description)
+	return hostname, osType, agentType, version, nil
 }
 
 func connectionSourceIP(conn types.Connection) string {
@@ -672,6 +692,26 @@ ORDER BY a.last_seen DESC`)
 			http.Error(w, "could not read agent records", http.StatusInternalServerError)
 			cp.logger.Printf("scan agent record: %v", err)
 			return
+		}
+		if item.Hostname == "" || item.OSType == "" || item.AgentType == "" || item.AgentVersion == "" {
+			hostname, osType, agentType, version, err := storedAgentMetadata(item.AgentDescription)
+			if err != nil {
+				http.Error(w, "could not read agent metadata", http.StatusInternalServerError)
+				cp.logger.Printf("decode stored agent description for %s: %v", item.InstanceUID, err)
+				return
+			}
+			if item.Hostname == "" {
+				item.Hostname = hostname
+			}
+			if item.OSType == "" {
+				item.OSType = osType
+			}
+			if item.AgentType == "" {
+				item.AgentType = agentType
+			}
+			if item.AgentVersion == "" {
+				item.AgentVersion = version
+			}
 		}
 		agents = append(agents, item)
 	}
