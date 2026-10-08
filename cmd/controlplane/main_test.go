@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -112,3 +113,43 @@ func TestMarshalAbsentStatusDoesNotOverwriteExistingValues(t *testing.T) {
 		t.Fatalf("marshalReportedConfigFiles(nil) = %q, want nil to preserve prior report", *reported)
 	}
 }
+
+func TestAgentMetadata(t *testing.T) {
+	description := &protobufs.AgentDescription{
+		IdentifyingAttributes: []*protobufs.KeyValue{
+			{Key: "host.name", Value: &protobufs.AnyValue{Value: &protobufs.AnyValue_StringValue{StringValue: "vm-01"}}},
+			{Key: "os.type", Value: &protobufs.AnyValue{Value: &protobufs.AnyValue_StringValue{StringValue: "linux"}}},
+			{Key: "service.name", Value: &protobufs.AnyValue{Value: &protobufs.AnyValue_StringValue{StringValue: "otelcol-contrib"}}},
+			{Key: "service.version", Value: &protobufs.AnyValue{Value: &protobufs.AnyValue_StringValue{StringValue: "0.159.0"}}},
+		},
+	}
+
+	hostname, osType, agentType, version := agentMetadata(description)
+	if hostname != "vm-01" || osType != "linux" || agentType != "otelcol-contrib" || version != "0.159.0" {
+		t.Fatalf("agentMetadata() = (%q, %q, %q, %q)", hostname, osType, agentType, version)
+	}
+}
+
+func TestSourceIPFromAddr(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		addr net.Addr
+		want string
+	}{
+		{name: "ipv4", addr: &net.TCPAddr{IP: net.ParseIP("192.0.2.15"), Port: 4320}, want: "192.0.2.15"},
+		{name: "ipv6", addr: &net.TCPAddr{IP: net.ParseIP("2001:db8::1"), Port: 4320}, want: "2001:db8::1"},
+		{name: "nil", addr: nil, want: ""},
+		{name: "invalid", addr: testAddr("unknown"), want: ""},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := sourceIPFromAddr(test.addr); got != test.want {
+				t.Fatalf("sourceIPFromAddr() = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
+type testAddr string
+
+func (addr testAddr) Network() string { return "test" }
+func (addr testAddr) String() string  { return string(addr) }

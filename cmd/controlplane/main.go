@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -169,6 +170,11 @@ func migrate(ctx context.Context, pool *pgxpool.Pool) error {
 	const schema = `
 CREATE TABLE IF NOT EXISTS agents (
     instance_uid BYTEA PRIMARY KEY CHECK (octet_length(instance_uid) = 16),
+    hostname TEXT NOT NULL DEFAULT '',
+    os_type TEXT NOT NULL DEFAULT '',
+    agent_type TEXT NOT NULL DEFAULT '',
+    agent_version TEXT NOT NULL DEFAULT '',
+    source_ip TEXT NOT NULL DEFAULT '',
     agent_description JSONB NOT NULL DEFAULT '{}'::jsonb,
     health JSONB NOT NULL DEFAULT '{}'::jsonb,
     effective_config JSONB NOT NULL DEFAULT '{}'::jsonb,
@@ -178,6 +184,11 @@ CREATE TABLE IF NOT EXISTS agents (
     last_seen TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS reported_config_files JSONB NOT NULL DEFAULT '{}'::jsonb;
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS hostname TEXT NOT NULL DEFAULT '';
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS os_type TEXT NOT NULL DEFAULT '';
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS agent_type TEXT NOT NULL DEFAULT '';
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS agent_version TEXT NOT NULL DEFAULT '';
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS source_ip TEXT NOT NULL DEFAULT '';
 CREATE TABLE IF NOT EXISTS config_revisions (
     id BIGSERIAL PRIMARY KEY,
     instance_uid BYTEA NOT NULL REFERENCES agents(instance_uid) ON DELETE CASCADE,
@@ -211,7 +222,7 @@ func (cp *controlPlane) onMessage(ctx context.Context, conn types.Connection, me
 		return response
 	}
 
-	if err := cp.saveStatus(ctx, message); err != nil {
+	if err := cp.saveStatus(ctx, conn, message); err != nil {
 		cp.logger.Printf("persist status for %x: %v", message.GetInstanceUid(), err)
 		return response
 	}
@@ -237,7 +248,7 @@ func (cp *controlPlane) onMessage(ctx context.Context, conn types.Connection, me
 	return response
 }
 
-func (cp *controlPlane) saveStatus(ctx context.Context, message *protobufs.AgentToServer) error {
+func (cp *controlPlane) saveStatus(ctx context.Context, conn types.Connection, message *protobufs.AgentToServer) error {
 	description, err := marshalOptional(message.GetAgentDescription())
 	if err != nil {
 		return fmt.Errorf("marshal agent description: %w", err)
@@ -258,22 +269,83 @@ func (cp *controlPlane) saveStatus(ctx context.Context, message *protobufs.Agent
 	if err != nil {
 		return fmt.Errorf("marshal reported config files: %w", err)
 	}
+	hostname, osType, agentType, agentVersion := agentMetadata(message.GetAgentDescription())
+	sourceIP := connectionSourceIP(conn)
 	_, err = cp.db.Exec(ctx, `
 INSERT INTO agents (
-    instance_uid, agent_description, health, effective_config, reported_config_files, remote_config_status, connected, last_seen
-) VALUES ($1, COALESCE($2::jsonb, '{}'::jsonb), COALESCE($3::jsonb, '{}'::jsonb),
-          COALESCE($4::jsonb, '{}'::jsonb), COALESCE($5::jsonb, '{}'::jsonb),
-          COALESCE($6::jsonb, '{}'::jsonb), TRUE, NOW())
+    instance_uid, hostname, os_type, agent_type, agent_version, source_ip,
+    agent_description, health, effective_config, reported_config_files, remote_config_status, connected, last_seen
+) VALUES ($1, COALESCE($2, ''), COALESCE($3, ''), COALESCE($4, ''), COALESCE($5, ''), COALESCE($6, ''),
+          COALESCE($7::jsonb, '{}'::jsonb), COALESCE($8::jsonb, '{}'::jsonb),
+          COALESCE($9::jsonb, '{}'::jsonb), COALESCE($10::jsonb, '{}'::jsonb),
+          COALESCE($11::jsonb, '{}'::jsonb), TRUE, NOW())
 ON CONFLICT (instance_uid) DO UPDATE SET
-    agent_description = COALESCE($2::jsonb, agents.agent_description),
-    health = COALESCE($3::jsonb, agents.health),
-    effective_config = COALESCE($4::jsonb, agents.effective_config),
-    reported_config_files = COALESCE($5::jsonb, agents.reported_config_files),
-    remote_config_status = COALESCE($6::jsonb, agents.remote_config_status),
+    hostname = COALESCE(NULLIF($2, ''), agents.hostname),
+    os_type = COALESCE(NULLIF($3, ''), agents.os_type),
+    agent_type = COALESCE(NULLIF($4, ''), agents.agent_type),
+    agent_version = COALESCE(NULLIF($5, ''), agents.agent_version),
+    source_ip = COALESCE(NULLIF($6, ''), agents.source_ip),
+    agent_description = COALESCE($7::jsonb, agents.agent_description),
+    health = COALESCE($8::jsonb, agents.health),
+    effective_config = COALESCE($9::jsonb, agents.effective_config),
+    reported_config_files = COALESCE($10::jsonb, agents.reported_config_files),
+    remote_config_status = COALESCE($11::jsonb, agents.remote_config_status),
     connected = TRUE,
     last_seen = NOW()`,
-		message.GetInstanceUid(), description, health, effectiveConfig, reportedConfigFiles, configStatus)
+		message.GetInstanceUid(), nullableString(hostname), nullableString(osType),
+		nullableString(agentType), nullableString(agentVersion), nullableString(sourceIP),
+		description, health, effectiveConfig, reportedConfigFiles, configStatus)
 	return err
+}
+
+func agentMetadata(description *protobufs.AgentDescription) (hostname, osType, agentType, version string) {
+	if description == nil {
+		return "", "", "", ""
+	}
+	for _, attribute := range description.GetIdentifyingAttributes() {
+		if attribute == nil || attribute.GetValue() == nil {
+			continue
+		}
+		value := attribute.GetValue().GetStringValue()
+		switch attribute.GetKey() {
+		case "host.name", "host.hostname":
+			if hostname == "" {
+				hostname = value
+			}
+		case "os.type":
+			osType = value
+		case "service.name":
+			agentType = value
+		case "service.version":
+			version = value
+		}
+	}
+	return hostname, osType, agentType, version
+}
+
+func connectionSourceIP(conn types.Connection) string {
+	if conn == nil || conn.Connection() == nil || conn.Connection().RemoteAddr() == nil {
+		return ""
+	}
+	return sourceIPFromAddr(conn.Connection().RemoteAddr())
+}
+
+func sourceIPFromAddr(address net.Addr) string {
+	if address == nil {
+		return ""
+	}
+	host, _, err := net.SplitHostPort(address.String())
+	if err != nil {
+		return ""
+	}
+	return host
+}
+
+func nullableString(value string) any {
+	if value == "" {
+		return nil
+	}
+	return value
 }
 
 func marshalReportedConfigFiles(effectiveConfig *protobufs.EffectiveConfig) (*string, error) {
@@ -393,11 +465,11 @@ func (cp *controlPlane) adminPage(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write([]byte(`<!doctype html>
 <html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width">
 <title>OpAMP Control Plane</title>
-<style>body{font:16px system-ui;max-width:1100px;margin:2rem auto;padding:0 1rem}textarea{box-sizing:border-box;width:100%;height:16rem;font:14px monospace}table{border-collapse:collapse;width:100%;display:block;overflow-x:auto}td,th{padding:.5rem;border:1px solid #ccc;text-align:left;white-space:nowrap}button{padding:.5rem;cursor:pointer}pre{white-space:pre-wrap;overflow-wrap:anywhere}.config-view{min-height:8rem;padding:1rem;background:#f4f4f4;border:1px solid #ccc}</style>
+<style>body{font:16px system-ui;max-width:1400px;margin:2rem auto;padding:0 1rem}textarea{box-sizing:border-box;width:100%;height:16rem;font:14px monospace}table{border-collapse:collapse;width:100%;display:block;overflow-x:auto}td,th{padding:.5rem;border:1px solid #ccc;text-align:left;white-space:nowrap}button{padding:.5rem;cursor:pointer}pre{white-space:pre-wrap;overflow-wrap:anywhere}.config-view{min-height:8rem;padding:1rem;background:#f4f4f4;border:1px solid #ccc}</style>
 <h1>OpAMP Control Plane (staging)</h1>
 <p>Agent authentication and TLS are not enabled. Use only on a trusted local staging host.</p>
 <button onclick="loadAgents()">Refresh agents</button><p id="error" role="alert"></p>
-<table><thead><tr><th>Instance UID</th><th>Service</th><th>Version</th><th>Connected</th><th>Last seen</th><th>Desired config</th><th>Reported config</th><th></th></tr></thead><tbody id="agents"></tbody></table>
+<table><thead><tr><th>Instance UID</th><th>Hostname</th><th>OS</th><th>Agent type</th><th>Version</th><th>Source IP</th><th>Connected</th><th>Last seen</th><th>Desired config</th><th>Reported config</th><th></th></tr></thead><tbody id="agents"></tbody></table>
 <h2>Selected agent</h2>
 <label>Agent instance UID<input id="uid" readonly style="display:block;width:100%"></label>
 <h3>Desired Collector YAML (editable)</h3>
@@ -411,7 +483,7 @@ const errorBox=document.querySelector('#error');
 let agentsByUID=new Map();
 function cell(row,value){const td=document.createElement('td');td.textContent=value;row.appendChild(td);return td}
 function selectAgent(uid){const agent=agentsByUID.get(uid);if(!agent)return;document.querySelector('#uid').value=uid;document.querySelector('#config').value=agent.desired_config||'';const files=agent.reported_config_files||{};const entries=Object.entries(files);document.querySelector('#reported').textContent=entries.length?entries.map(([name,content])=>(name?'# '+name+'\n':'')+content).join('\n\n'):'No effective config reported yet. Confirm the Supervisor has reports_effective_config enabled and refresh after it sends a status update.'}
-async function loadAgents(){errorBox.textContent='';const r=await fetch('/api/v1/agents');if(!r.ok)throw Error(await r.text());const agents=await r.json();agentsByUID=new Map(agents.map(agent=>[agent.instance_uid,agent]));agentsBody.replaceChildren();for(const agent of agents){const row=document.createElement('tr');cell(row,agent.instance_uid);const description=agent.agent_description||{};cell(row,description.serviceName||description.service_name||'');cell(row,description.serviceVersion||description.service_version||'');cell(row,agent.connected?'Yes':'No');cell(row,new Date(agent.last_seen).toLocaleString());cell(row,agent.desired_config?'Saved':'Not set');cell(row,Object.keys(agent.reported_config_files||{}).length?'Available':'Not reported');const action=cell(row,'');const button=document.createElement('button');button.textContent='View / edit';button.onclick=()=>selectAgent(agent.instance_uid);action.appendChild(button);agentsBody.appendChild(row)}const uid=document.querySelector('#uid').value;if(uid)selectAgent(uid)}
+async function loadAgents(){errorBox.textContent='';const r=await fetch('/api/v1/agents');if(!r.ok)throw Error(await r.text());const agents=await r.json();agentsByUID=new Map(agents.map(agent=>[agent.instance_uid,agent]));agentsBody.replaceChildren();for(const agent of agents){const row=document.createElement('tr');cell(row,agent.instance_uid);cell(row,agent.hostname);cell(row,agent.os_type);cell(row,agent.agent_type);cell(row,agent.agent_version);cell(row,agent.source_ip);cell(row,agent.connected?'Yes':'No');cell(row,new Date(agent.last_seen).toLocaleString());cell(row,agent.desired_config?'Saved':'Not set');cell(row,Object.keys(agent.reported_config_files||{}).length?'Available':'Not reported');const action=cell(row,'');const button=document.createElement('button');button.textContent='View / edit';button.onclick=()=>selectAgent(agent.instance_uid);action.appendChild(button);agentsBody.appendChild(row)}const uid=document.querySelector('#uid').value;if(uid)selectAgent(uid)}
 async function saveConfig(){try{const uid=document.querySelector('#uid').value.trim();if(!uid)throw Error('Select an agent first.');const config=document.querySelector('#config').value;const r=await fetch('/api/v1/agents/'+encodeURIComponent(uid)+'/config',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({config})});const body=await r.text();if(!r.ok)throw Error(body);await loadAgents();alert("Configuration saved. It will be offered on the agent's next status report.")}catch(e){errorBox.textContent=e.message}}
 loadAgents().catch(e=>errorBox.textContent=e.message);
 </script></html>`))
@@ -421,7 +493,7 @@ func (cp *controlPlane) listAgents(w http.ResponseWriter, r *http.Request) {
 	rows, err := cp.db.Query(r.Context(), `
 SELECT encode(a.instance_uid, 'hex'), a.agent_description, a.health, a.effective_config,
        a.reported_config_files, a.remote_config_status, a.connected, a.last_seen,
-       COALESCE(c.config, '')
+       COALESCE(c.config, ''), a.hostname, a.os_type, a.agent_type, a.agent_version, a.source_ip
 FROM agents a
 LEFT JOIN agent_configs c ON c.instance_uid = a.instance_uid
 ORDER BY a.last_seen DESC`)
@@ -442,11 +514,16 @@ ORDER BY a.last_seen DESC`)
 		Connected           bool            `json:"connected"`
 		LastSeen            time.Time       `json:"last_seen"`
 		DesiredConfig       string          `json:"desired_config"`
+		Hostname            string          `json:"hostname"`
+		OSType              string          `json:"os_type"`
+		AgentType           string          `json:"agent_type"`
+		AgentVersion        string          `json:"agent_version"`
+		SourceIP            string          `json:"source_ip"`
 	}
 	agents := make([]agent, 0)
 	for rows.Next() {
 		var item agent
-		if err := rows.Scan(&item.InstanceUID, &item.AgentDescription, &item.Health, &item.EffectiveConfig, &item.ReportedConfigFiles, &item.RemoteConfigStatus, &item.Connected, &item.LastSeen, &item.DesiredConfig); err != nil {
+		if err := rows.Scan(&item.InstanceUID, &item.AgentDescription, &item.Health, &item.EffectiveConfig, &item.ReportedConfigFiles, &item.RemoteConfigStatus, &item.Connected, &item.LastSeen, &item.DesiredConfig, &item.Hostname, &item.OSType, &item.AgentType, &item.AgentVersion, &item.SourceIP); err != nil {
 			http.Error(w, "could not read agent records", http.StatusInternalServerError)
 			cp.logger.Printf("scan agent record: %v", err)
 			return

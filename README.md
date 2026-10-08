@@ -35,6 +35,9 @@ To delete the stored staging data as well, run `docker compose down --volumes`.
   status, and last-seen/connected state in PostgreSQL.
 - Lists agents in the Basic-Auth-protected UI and JSON API, including saved
   desired configs and human-readable effective config files reported by agents.
+- Shows agent hostname, OS type, service/type name, version, and source IP when
+  the agent reports those resource attributes and connects directly to the
+  server.
 - Saves versioned desired Collector configurations and offers them to agents
   in OpAMP responses.
 - Provides `GET /healthz` for an unauthenticated database readiness check.
