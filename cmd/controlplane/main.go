@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -32,9 +33,16 @@ import (
 )
 
 const (
-	opampAddress = "0.0.0.0:4320"
-	adminAddress = "0.0.0.0:4321"
+	opampAddress       = "0.0.0.0:4320"
+	adminAddress       = "0.0.0.0:4321"
+	adminSessionCookie = "opamp_admin_session"
+	adminSessionTTL    = 12 * time.Hour
 )
+
+type loginRequest struct {
+	Username string `json:"username"`
+	Password string `json:"password"`
+}
 
 type controlPlane struct {
 	db          *pgxpool.Pool
@@ -623,6 +631,27 @@ func (cp *controlPlane) adminHandler(username, password string) http.Handler {
 	})
 	mux.Handle("GET /assets/", assets)
 	mux.HandleFunc("GET /", serveAdminUI)
+	mux.HandleFunc("GET /api/v1/session", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]bool{"authenticated": validAdminSession(r, username, password)})
+	})
+	mux.HandleFunc("POST /api/v1/login", func(w http.ResponseWriter, r *http.Request) {
+		r.Body = http.MaxBytesReader(w, r.Body, 4096)
+		var input loginRequest
+		if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+			http.Error(w, "invalid login request", http.StatusBadRequest)
+			return
+		}
+		if !adminCredentialsMatch(input.Username, input.Password, username, password) {
+			http.Error(w, "invalid username or password", http.StatusUnauthorized)
+			return
+		}
+		http.SetCookie(w, newAdminSessionCookie(r, username, password))
+		writeJSON(w, http.StatusOK, map[string]bool{"authenticated": true})
+	})
+	mux.HandleFunc("POST /api/v1/logout", func(w http.ResponseWriter, r *http.Request) {
+		http.SetCookie(w, expiredAdminSessionCookie(r))
+		writeJSON(w, http.StatusOK, map[string]bool{"authenticated": false})
+	})
 	mux.HandleFunc("GET /api/v1/agents", cp.listAgents)
 	mux.HandleFunc("PUT /api/v1/agents/{uid}/config", cp.putConfig)
 	mux.HandleFunc("GET /api/v1/agents/{uid}/config", cp.getConfig)
@@ -631,34 +660,97 @@ func (cp *controlPlane) adminHandler(username, password string) http.Handler {
 	mux.HandleFunc("POST /api/v1/agent-tokens", cp.createBootstrapToken)
 	mux.HandleFunc("POST /api/v1/agent-tokens/{id}/rotate", cp.rotateAgentToken)
 	mux.HandleFunc("DELETE /api/v1/agent-tokens/{id}", cp.revokeAgentToken)
-	protected := basicAuth(username, password, mux)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/healthz" && r.Method == http.MethodGet {
 			healthHandler.ServeHTTP(w, r)
 			return
 		}
-		protected.ServeHTTP(w, r)
+		if r.URL.Path == "/" || strings.HasPrefix(r.URL.Path, "/assets/") ||
+			r.URL.Path == "/api/v1/session" || r.URL.Path == "/api/v1/login" ||
+			r.URL.Path == "/api/v1/logout" {
+			if strings.HasPrefix(r.URL.Path, "/api/") {
+				w.Header().Set("Cache-Control", "no-store")
+			}
+			mux.ServeHTTP(w, r)
+			return
+		}
+		w.Header().Set("Cache-Control", "no-store")
+		if !validAdminSession(r, username, password) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"error":"authentication required"}`))
+			return
+		}
+		mux.ServeHTTP(w, r)
 	})
 }
 
-func basicAuth(username, password string, next http.Handler) http.Handler {
+func adminCredentialsMatch(gotUsername, gotPassword, username, password string) bool {
 	expectedUser := sha256.Sum256([]byte(username))
 	expectedPassword := sha256.Sum256([]byte(password))
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotUser, gotPassword, ok := r.BasicAuth()
-		if ok {
-			userHash := sha256.Sum256([]byte(gotUser))
-			passwordHash := sha256.Sum256([]byte(gotPassword))
-			ok = subtle.ConstantTimeCompare(userHash[:], expectedUser[:]) == 1 &&
-				subtle.ConstantTimeCompare(passwordHash[:], expectedPassword[:]) == 1
-		}
-		if !ok {
-			w.Header().Set("WWW-Authenticate", `Basic realm="OpAMP control plane", charset="UTF-8"`)
-			http.Error(w, "authentication required", http.StatusUnauthorized)
-			return
-		}
-		next.ServeHTTP(w, r)
-	})
+	userHash := sha256.Sum256([]byte(gotUsername))
+	passwordHash := sha256.Sum256([]byte(gotPassword))
+	return subtle.ConstantTimeCompare(userHash[:], expectedUser[:]) == 1 &&
+		subtle.ConstantTimeCompare(passwordHash[:], expectedPassword[:]) == 1
+}
+
+func adminSessionMAC(expires string, username, password string) []byte {
+	key := sha256.Sum256([]byte("opamp-admin-session:" + username + "\x00" + password))
+	mac := hmac.New(sha256.New, key[:])
+	_, _ = mac.Write([]byte(expires))
+	return mac.Sum(nil)
+}
+
+func newAdminSessionCookie(r *http.Request, username, password string) *http.Cookie {
+	expires := strconv.FormatInt(time.Now().Add(adminSessionTTL).Unix(), 10)
+	value := expires + "." + base64.RawURLEncoding.EncodeToString(adminSessionMAC(expires, username, password))
+	return &http.Cookie{
+		Name:     adminSessionCookie,
+		Value:    value,
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https",
+		SameSite: http.SameSiteStrictMode,
+		MaxAge:   int(adminSessionTTL.Seconds()),
+	}
+}
+
+func expiredAdminSessionCookie(r *http.Request) *http.Cookie {
+	return &http.Cookie{
+		Name:     adminSessionCookie,
+		Value:    "",
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https",
+		SameSite: http.SameSiteStrictMode,
+		MaxAge:   -1,
+		Expires:  time.Unix(1, 0),
+	}
+}
+
+func validAdminSession(r *http.Request, username, password string) bool {
+	cookie, err := r.Cookie(adminSessionCookie)
+	if err != nil {
+		return false
+	}
+	parts := strings.Split(cookie.Value, ".")
+	if len(parts) != 2 {
+		return false
+	}
+	expiresAt, err := strconv.ParseInt(parts[0], 10, 64)
+	if err != nil {
+		return false
+	}
+	now := time.Now()
+	expires := time.Unix(expiresAt, 0)
+	if !expires.After(now) || expires.After(now.Add(adminSessionTTL+time.Minute)) {
+		return false
+	}
+	signature, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return false
+	}
+	return hmac.Equal(signature, adminSessionMAC(parts[0], username, password))
 }
 
 func (cp *controlPlane) listAgents(w http.ResponseWriter, r *http.Request) {

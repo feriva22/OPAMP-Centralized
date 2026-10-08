@@ -13,21 +13,13 @@ import (
 	"google.golang.org/protobuf/encoding/protojson"
 )
 
-func TestAdminUIIsEmbeddedAndProtected(t *testing.T) {
+func TestAdminUIProvidesLoginPage(t *testing.T) {
 	handler := (&controlPlane{}).adminHandler("operator", "a-long-staging-password")
 
-	unauthorized := httptest.NewRecorder()
-	handler.ServeHTTP(unauthorized, httptest.NewRequest(http.MethodGet, "/", nil))
-	if unauthorized.Code != http.StatusUnauthorized {
-		t.Fatalf("unauthenticated status = %d, want %d", unauthorized.Code, http.StatusUnauthorized)
-	}
-
-	request := httptest.NewRequest(http.MethodGet, "/", nil)
-	request.SetBasicAuth("operator", "a-long-staging-password")
 	response := httptest.NewRecorder()
-	handler.ServeHTTP(response, request)
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/", nil))
 	if response.Code != http.StatusOK {
-		t.Fatalf("authenticated status = %d, want %d", response.Code, http.StatusOK)
+		t.Fatalf("login page status = %d, want %d", response.Code, http.StatusOK)
 	}
 	if got := response.Header().Get("Content-Type"); got != "text/html; charset=utf-8" {
 		t.Fatalf("Content-Type = %q, want HTML", got)
@@ -36,9 +28,7 @@ func TestAdminUIIsEmbeddedAndProtected(t *testing.T) {
 	if len(assetPath) != 2 {
 		t.Fatal("embedded admin page does not reference a built JavaScript asset")
 	}
-
 	assetRequest := httptest.NewRequest(http.MethodGet, "/assets/"+assetPath[1], nil)
-	assetRequest.SetBasicAuth("operator", "a-long-staging-password")
 	assetResponse := httptest.NewRecorder()
 	handler.ServeHTTP(assetResponse, assetRequest)
 	if assetResponse.Code != http.StatusOK {
@@ -49,41 +39,82 @@ func TestAdminUIIsEmbeddedAndProtected(t *testing.T) {
 	}
 }
 
-func TestBasicAuth(t *testing.T) {
-	handler := basicAuth("operator", "a-long-staging-password", http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusNoContent)
-	}))
+func TestAdminLoginAndSessionCookie(t *testing.T) {
+	const username = "operator"
+	const password = "a-long-staging-password"
+	handler := (&controlPlane{}).adminHandler(username, password)
 
-	t.Run("rejects missing credentials", func(t *testing.T) {
-		response := httptest.NewRecorder()
-		handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/", nil))
-		if response.Code != http.StatusUnauthorized {
-			t.Fatalf("status = %d, want %d", response.Code, http.StatusUnauthorized)
-		}
-		if response.Header().Get("WWW-Authenticate") == "" {
-			t.Fatal("missing WWW-Authenticate challenge")
-		}
-	})
+	statusResponse := httptest.NewRecorder()
+	handler.ServeHTTP(statusResponse, httptest.NewRequest(http.MethodGet, "/api/v1/session", nil))
+	if statusResponse.Code != http.StatusOK || !strings.Contains(statusResponse.Body.String(), `"authenticated":false`) {
+		t.Fatalf("unauthenticated session response = %d %s", statusResponse.Code, statusResponse.Body.String())
+	}
 
-	t.Run("accepts correct credentials", func(t *testing.T) {
-		request := httptest.NewRequest(http.MethodGet, "/", nil)
-		request.SetBasicAuth("operator", "a-long-staging-password")
-		response := httptest.NewRecorder()
-		handler.ServeHTTP(response, request)
-		if response.Code != http.StatusNoContent {
-			t.Fatalf("status = %d, want %d", response.Code, http.StatusNoContent)
-		}
-	})
+	protectedResponse := httptest.NewRecorder()
+	handler.ServeHTTP(protectedResponse, httptest.NewRequest(http.MethodGet, "/api/v1/agent-tokens", nil))
+	if protectedResponse.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated API status = %d, want %d", protectedResponse.Code, http.StatusUnauthorized)
+	}
 
-	t.Run("rejects incorrect password", func(t *testing.T) {
-		request := httptest.NewRequest(http.MethodGet, "/", nil)
-		request.SetBasicAuth("operator", "wrong-password")
-		response := httptest.NewRecorder()
-		handler.ServeHTTP(response, request)
-		if response.Code != http.StatusUnauthorized {
-			t.Fatalf("status = %d, want %d", response.Code, http.StatusUnauthorized)
-		}
-	})
+	wrongRequest := httptest.NewRequest(http.MethodPost, "/api/v1/login", strings.NewReader(`{"username":"operator","password":"wrong-password"}`))
+	wrongRequest.Header.Set("Content-Type", "application/json")
+	wrongResponse := httptest.NewRecorder()
+	handler.ServeHTTP(wrongResponse, wrongRequest)
+	if wrongResponse.Code != http.StatusUnauthorized {
+		t.Fatalf("invalid login status = %d, want %d", wrongResponse.Code, http.StatusUnauthorized)
+	}
+
+	loginRequest := httptest.NewRequest(http.MethodPost, "/api/v1/login", strings.NewReader(`{"username":"operator","password":"a-long-staging-password"}`))
+	loginRequest.Header.Set("Content-Type", "application/json")
+	loginRequest.Header.Set("X-Forwarded-Proto", "https")
+	loginResponse := httptest.NewRecorder()
+	handler.ServeHTTP(loginResponse, loginRequest)
+	if loginResponse.Code != http.StatusOK {
+		t.Fatalf("login status = %d, want %d", loginResponse.Code, http.StatusOK)
+	}
+	cookies := loginResponse.Result().Cookies()
+	if len(cookies) != 1 || cookies[0].Name != adminSessionCookie {
+		t.Fatalf("login cookies = %#v, want one admin session cookie", cookies)
+	}
+	if !cookies[0].HttpOnly || !cookies[0].Secure || cookies[0].SameSite != http.SameSiteStrictMode {
+		t.Fatalf("session cookie security attributes are incomplete: %#v", cookies[0])
+	}
+
+	sessionRequest := httptest.NewRequest(http.MethodGet, "/api/v1/session", nil)
+	sessionRequest.AddCookie(cookies[0])
+	sessionResponse := httptest.NewRecorder()
+	handler.ServeHTTP(sessionResponse, sessionRequest)
+	if sessionResponse.Code != http.StatusOK || !strings.Contains(sessionResponse.Body.String(), `"authenticated":true`) {
+		t.Fatalf("authenticated session response = %d %s", sessionResponse.Code, sessionResponse.Body.String())
+	}
+	if !validAdminSession(sessionRequest, username, password) {
+		t.Fatal("valid login cookie was rejected")
+	}
+	authenticatedRequest := httptest.NewRequest(http.MethodGet, "/private-route-not-found", nil)
+	authenticatedRequest.AddCookie(cookies[0])
+	authenticatedResponse := httptest.NewRecorder()
+	handler.ServeHTTP(authenticatedResponse, authenticatedRequest)
+	if authenticatedResponse.Code != http.StatusNotFound {
+		t.Fatalf("authenticated request status = %d, want route's %d response", authenticatedResponse.Code, http.StatusNotFound)
+	}
+
+	tamperedRequest := httptest.NewRequest(http.MethodGet, "/api/v1/session", nil)
+	tamperedRequest.AddCookie(&http.Cookie{Name: adminSessionCookie, Value: cookies[0].Value + "tampered"})
+	if validAdminSession(tamperedRequest, username, password) {
+		t.Fatal("tampered session cookie was accepted")
+	}
+
+	logoutResponse := httptest.NewRecorder()
+	handler.ServeHTTP(logoutResponse, httptest.NewRequest(http.MethodPost, "/api/v1/logout", nil))
+	logoutCookies := logoutResponse.Result().Cookies()
+	if len(logoutCookies) != 1 || logoutCookies[0].MaxAge >= 0 {
+		t.Fatalf("logout cookie = %#v, want expired cookie", logoutCookies)
+	}
+	logoutRequest := httptest.NewRequest(http.MethodGet, "/", nil)
+	logoutRequest.AddCookie(logoutCookies[0])
+	if validAdminSession(logoutRequest, username, password) {
+		t.Fatal("logged-out cookie was accepted")
+	}
 }
 
 func TestDecodeUID(t *testing.T) {

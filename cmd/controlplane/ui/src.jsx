@@ -16,7 +16,17 @@ const icons = {
 async function api(path, options) {
   const response = await fetch(path, options);
   const text = await response.text();
-  if (!response.ok) throw new Error(text.trim() || `Request failed (${response.status})`);
+  if (!response.ok) {
+    let message = text.trim() || `Request failed (${response.status})`;
+    try {
+      message = JSON.parse(text).error || message;
+    } catch {
+      // Non-JSON HTTP errors are returned as plain text.
+    }
+    const error = new Error(message);
+    error.status = response.status;
+    throw error;
+  }
   return text ? JSON.parse(text) : null;
 }
 
@@ -31,6 +41,10 @@ function shortUID(value = '') {
 }
 
 function App() {
+  const [authenticated, setAuthenticated] = useState(null);
+  const [loginUsername, setLoginUsername] = useState('');
+  const [loginPassword, setLoginPassword] = useState('');
+  const [loginBusy, setLoginBusy] = useState(false);
   const [page, setPage] = useState('overview');
   const [agents, setAgents] = useState([]);
   const [tokens, setTokens] = useState([]);
@@ -65,6 +79,7 @@ function App() {
         api('/api/v1/agents'),
         api('/api/v1/agent-tokens'),
       ]);
+      setAuthenticated(true);
       setAgents(nextAgents);
       setTokens(nextTokens);
       if (selectedUID && !nextAgents.some((agent) => agent.instance_uid === selectedUID)) {
@@ -72,13 +87,29 @@ function App() {
       }
       if (showMessage) setNotice('Data refreshed.');
     } catch (cause) {
-      setError(cause.message);
+      if (cause.status === 401) {
+        setAuthenticated(false);
+        setAgents([]);
+        setTokens([]);
+      } else {
+        setError(cause.message);
+      }
     } finally {
       setBusy(false);
     }
   }
 
-  useEffect(() => { refresh(); }, []);
+  useEffect(() => {
+    api('/api/v1/session')
+      .then((session) => {
+        setAuthenticated(session.authenticated);
+        if (session.authenticated) refresh();
+      })
+      .catch((cause) => {
+        setAuthenticated(false);
+        setError(cause.message);
+      });
+  }, []);
   useEffect(() => {
     if (!selectedAgent) {
       setConfig('');
@@ -181,6 +212,47 @@ function App() {
     }
   }
 
+  async function login(event) {
+    event.preventDefault();
+    setLoginBusy(true);
+    setError('');
+    try {
+      await api('/api/v1/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: loginUsername, password: loginPassword }),
+      });
+      setLoginPassword('');
+      setAuthenticated(true);
+      await refresh();
+    } catch (cause) {
+      setError(cause.message);
+    } finally {
+      setLoginBusy(false);
+    }
+  }
+
+  async function logout() {
+    setError('');
+    try {
+      await api('/api/v1/logout', { method: 'POST' });
+      setAuthenticated(false);
+      setAgents([]);
+      setTokens([]);
+      setSelectedUID('');
+      setIssuedToken(null);
+    } catch (cause) {
+      setError(cause.message);
+    }
+  }
+
+  if (authenticated === null) {
+    return <div class="auth-loading">Loading control plane…</div>;
+  }
+  if (!authenticated) {
+    return <LoginPage username={loginUsername} setUsername={setLoginUsername} password={loginPassword} setPassword={setLoginPassword} onSubmit={login} busy={loginBusy} error={error} />;
+  }
+
   const connectedCount = agents.filter((agent) => agent.connected).length;
   const activeTokens = tokens.filter((token) => !token.revoked_at).length;
 
@@ -199,7 +271,7 @@ function App() {
         </nav>
         <div class="sidebar-bottom">
           <div class="connection-card"><span class="live-dot" /><span><strong>Control plane online</strong><small>Staging environment</small></span></div>
-          <div class="sidebar-foot">{icons.shield} Operator session protected by Basic Auth</div>
+          <div class="sidebar-foot">{icons.shield} Signed operator session · expires after 12 hours</div>
         </div>
       </aside>
       <main class="main">
@@ -208,6 +280,7 @@ function App() {
           <div class="top-actions">
             <span class="endpoint"><span class="live-dot" /> OpAMP <code>ws://</code></span>
             <button class="icon-button" title="Refresh data" onClick={() => refresh(true)} disabled={busy}>{icons.refresh}</button>
+            <button class="button button-small" onClick={logout}>Log out</button>
             <div class="avatar">OP</div>
           </div>
         </header>
@@ -236,6 +309,24 @@ function App() {
         <footer class="footer"><span>OpAMP Centralized Control Plane</span><span>Agent credentials are sensitive · plaintext WebSocket staging mode</span></footer>
       </main>
     </div>
+  );
+}
+
+function LoginPage({ username, setUsername, password, setPassword, onSubmit, busy, error }) {
+  return (
+    <main class="login-shell">
+      <form class="login-card" onSubmit={onSubmit}>
+        <div class="login-brand"><span class="brand-mark">O</span><span><strong>OpAMP</strong><small>CONTROL PLANE</small></span></div>
+        <div class="eyebrow">OPERATOR ACCESS</div>
+        <h1>Sign in</h1>
+        <p>Sign in to manage your OpAMP agents and configurations.</p>
+        {error && <div class="banner banner-error" role="alert">{error}</div>}
+        <label class="login-field"><span>Username</span><input autoComplete="username" required value={username} onInput={(event) => setUsername(event.currentTarget.value)} /></label>
+        <label class="login-field"><span>Password</span><input type="password" autoComplete="current-password" required value={password} onInput={(event) => setPassword(event.currentTarget.value)} /></label>
+        <button class="button button-primary login-submit" type="submit" disabled={busy}>{busy ? 'Signing in…' : 'Sign in'}</button>
+        <small class="login-foot">Use the admin credentials configured in the server environment.</small>
+      </form>
+    </main>
   );
 }
 

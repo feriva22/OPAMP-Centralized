@@ -42,8 +42,8 @@ different listener names, update `http-routes.yaml`.
    | Key | Used by |
    | --- | --- |
    | `DATABASE_URL` | Control plane, for example `postgres://opamp:<URL-escaped-password>@postgres:5432/opamp?sslmode=disable` |
-   | `OPAMP_ADMIN_USERNAME` | Operator UI Basic Auth |
-   | `OPAMP_ADMIN_PASSWORD` | Operator UI Basic Auth; at least 16 characters |
+   | `OPAMP_ADMIN_USERNAME` | Static operator login username |
+   | `OPAMP_ADMIN_PASSWORD` | Static operator login password; at least 16 characters |
    | `POSTGRES_PASSWORD` | PostgreSQL initial database password |
 
    The password in `DATABASE_URL` must match `POSTGRES_PASSWORD`. URL-escape

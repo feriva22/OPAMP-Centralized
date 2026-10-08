@@ -19,9 +19,11 @@ networks**.
    docker compose up --build -d
    ```
 
-4. Open <http://localhost:4321>. The browser prompts for the operator Basic
-   Auth credentials. This serves the Preact-based Admin panel embedded in the
-   control-plane binary; no separate frontend service is needed.
+4. Open <http://localhost:4321> and sign in with `OPAMP_ADMIN_USERNAME` and
+   `OPAMP_ADMIN_PASSWORD`. The admin panel uses a signed, `HttpOnly`,
+   `SameSite=Strict` session cookie that expires after 12 hours. This serves
+   the Preact-based Admin panel embedded in the control-plane binary; no
+   separate frontend service is needed.
 
 The OpAMP endpoint is `ws://localhost:4320/v1/opamp`. Both ports are published
 according to the bindings in `docker-compose.yml`; PostgreSQL has no published
@@ -128,8 +130,15 @@ responses never contain it. Treat creation/rotation responses as secrets and
 do not save them in logs or shared shell history.
 
 Use an agent's 32-character hexadecimal (16-byte) instance UID from the agent
-list to save a configuration. The API is protected by the same Basic Auth as
-the UI:
+list to save a configuration. The API is protected by the same signed session
+as the UI. For command-line API use, first log in and save the session cookie:
+
+```sh
+curl -c opamp-cookies.txt \
+  -H "Content-Type: application/json" \
+  -X POST http://localhost:4321/api/v1/login \
+  --data "{\"username\":\"$OPAMP_ADMIN_USERNAME\",\"password\":\"$OPAMP_ADMIN_PASSWORD\"}"
+```
 
 ```text
 PUT /api/v1/agents/{instance_uid}/config
@@ -141,7 +150,7 @@ Content-Type: application/json
 For example, from a shell that has loaded the operator credentials:
 
 ```sh
-curl -u "$OPAMP_ADMIN_USERNAME:$OPAMP_ADMIN_PASSWORD" \
+curl -b opamp-cookies.txt \
   -H "Content-Type: application/json" \
   -X PUT http://localhost:4321/api/v1/agents/0123456789abcdef0123456789abcdef/config \
   --data '{"config":"receivers:\n  otlp:\n    protocols:\n      grpc:\n"}'
@@ -166,9 +175,10 @@ application must still be extended and security-reviewed:
 - Enable TLS (`wss://`) with certificates valid for the deployment hostname.
   The current OpAMP service uses plaintext WebSockets, so bearer tokens can be
   intercepted and replayed by anyone able to observe the connection.
-- Replace Basic Auth with the organization's operator identity system, add
-  roles and audit controls, and protect the UI/API with TLS. Basic Auth here is
-  only suitable for isolated staging.
+- Replace static environment-based operator credentials with the
+  organization's identity system, add roles and audit controls, and protect
+  the UI/API with TLS. The static single-user login is only suitable for
+  isolated staging.
 - Consider short-lived credentials or mTLS, credential expiry, and audited
   credential-management events before production use.
 - Validate and test configs before rollout; add staged rollout, approval,
