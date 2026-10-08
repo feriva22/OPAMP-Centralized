@@ -369,7 +369,7 @@ func (cp *controlPlane) adminPage(w http.ResponseWriter, r *http.Request) {
 <button onclick="saveConfig()">Save configuration</button>
 <script>
 async function loadAgents(){const r=await fetch('/api/v1/agents');document.querySelector('#result').textContent=JSON.stringify(await r.json(),null,2)}
-async function saveConfig(){const uid=document.querySelector('#uid').value.trim();const config=document.querySelector('#config').value;const r=await fetch('/api/v1/agents/'+encodeURIComponent(uid)+'/config',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({config})});const body=await r.text();if(!r.ok)throw Error(body);alert('Configuration saved. It will be offered on the agent\\'s next status report.')}
+async function saveConfig(){const uid=document.querySelector('#uid').value.trim();const config=document.querySelector('#config').value;const r=await fetch('/api/v1/agents/'+encodeURIComponent(uid)+'/config',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({config})});const body=await r.text();if(!r.ok)throw Error(body);alert("Configuration saved. It will be offered on the agent's next status report.")}
 loadAgents().catch(e=>document.querySelector('#result').textContent=e.message)
 </script></html>`))
 }
