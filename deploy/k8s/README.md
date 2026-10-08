@@ -23,9 +23,11 @@ or public load balancer by default.
    private, create an `imagePullSecret` in namespace `opamp` and reference it
    from the Deployment pod spec before syncing.
 
-2. Provision the `opamp-secrets` Secret **out of band** before syncing the
-   application. Do not commit credentials to Git. Use your cluster's approved
-   secret manager, External Secrets integration, or a securely managed Secret
+2. Provision the `opamp-secrets` Secret **out of band** in the target namespace
+   configured by `spec.destination.namespace` in the Argo CD Application before
+   syncing. The Kustomize manifests intentionally do not set a namespace.
+   Do not commit credentials to Git. Use your cluster's approved secret
+   manager, External Secrets integration, or a securely managed Secret
    workflow. It must contain these keys:
 
    | Key | Used by |
@@ -45,14 +47,18 @@ or public load balancer by default.
 1. Edit `deploy/argocd/application.yaml` and replace
    `https://github.com/OWNER/REPOSITORY.git` with this repository's clone URL.
    Set `targetRevision` to the branch you use for deployment.
-2. Create the target namespace before provisioning its secret:
+2. Set `spec.destination.namespace` to the namespace where you want to deploy.
+   Argo CD creates that namespace because `CreateNamespace=true` is enabled.
+   Provision the `opamp-secrets` Secret in that namespace before the first
+   sync. If provisioning the Secret before Argo CD creates the namespace,
+   create the namespace separately first:
 
    ```sh
-   kubectl create namespace opamp
+   kubectl create namespace <target-namespace>
    ```
 
-3. Ensure Argo CD can read this Git repository and provision `opamp-secrets`
-   in namespace `opamp` using the approved secret workflow.
+3. Ensure Argo CD can read this Git repository and the required Secret exists
+   in the configured destination namespace.
 4. Apply the Application manifest to the Argo CD namespace:
 
    ```sh
@@ -62,8 +68,8 @@ or public load balancer by default.
 Argo CD will sync the `deploy/k8s` Kustomize package. Check rollout status:
 
 ```sh
-kubectl -n opamp get pods,services,pvc
-kubectl -n opamp rollout status deployment/opamp-control-plane
+kubectl -n <target-namespace> get pods,services,pvc
+kubectl -n <target-namespace> rollout status deployment/opamp-control-plane
 ```
 
 ## Agent connectivity and admin access
@@ -71,7 +77,7 @@ kubectl -n opamp rollout status deployment/opamp-control-plane
 The in-cluster OpAMP endpoint is:
 
 ```text
-ws://opamp-control-plane.opamp.svc.cluster.local:4320/v1/opamp
+ws://opamp-control-plane.<target-namespace>.svc.cluster.local:4320/v1/opamp
 ```
 
 This application build uses plaintext WebSockets; bearer agent tokens and
@@ -83,7 +89,7 @@ The admin panel is served on port 4321 and remains cluster-internal. For
 temporary access from an operator machine, use a port-forward:
 
 ```sh
-kubectl -n opamp port-forward service/opamp-control-plane 4321:4321
+kubectl -n <target-namespace> port-forward service/opamp-control-plane 4321:4321
 ```
 
 Then open <http://localhost:4321>. Do not publicly expose the admin service
