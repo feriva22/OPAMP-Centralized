@@ -15,6 +15,16 @@ fail() {
   exit 1
 }
 
+has_version() {
+  local binary="$1"
+  local expected_version="$2"
+  local output
+  local version_pattern="${expected_version//./\\.}"
+
+  output="$("$binary" --version 2>&1)" || return 1
+  [[ "$output" =~ (^|[^0-9])${version_pattern}([^0-9]|$) ]]
+}
+
 usage() {
   cat <<'EOF'
 Usage: sudo bash ./install-agent.sh ws://SERVER_HOST:4320/v1/opamp
@@ -122,13 +132,31 @@ collector_url="https://github.com/open-telemetry/opentelemetry-collector-release
 supervisor_asset="opampsupervisor_${SUPERVISOR_VERSION}_linux_${ARCH}"
 supervisor_url="https://github.com/open-telemetry/opentelemetry-collector-releases/releases/download/cmd%2Fopampsupervisor%2Fv${SUPERVISOR_VERSION}/${supervisor_asset}"
 
-printf 'Downloading OpenTelemetry Collector Contrib %s (%s)...\n' "$COLLECTOR_VERSION" "$ARCH"
-download_verified "$collector_url" "${TEMP_DIR}/${collector_asset}"
-tar -xzf "${TEMP_DIR}/${collector_asset}" -C "$TEMP_DIR" otelcol-contrib
-[[ -x "${TEMP_DIR}/otelcol-contrib" ]] || fail "Collector binary missing from release archive"
+collector_binary="${INSTALL_ROOT}/bin/otelcol-contrib"
+if [[ -x "$collector_binary" ]] && has_version "$collector_binary" "$COLLECTOR_VERSION"; then
+  printf 'Detected Collector Contrib %s already installed; keeping existing binary.\n' "$COLLECTOR_VERSION"
+else
+  if [[ -x "$collector_binary" ]]; then
+    printf 'Existing Collector version differs from %s; updating it.\n' "$COLLECTOR_VERSION"
+  fi
+  printf 'Downloading OpenTelemetry Collector Contrib %s (%s)...\n' "$COLLECTOR_VERSION" "$ARCH"
+  download_verified "$collector_url" "${TEMP_DIR}/${collector_asset}"
+  tar -xzf "${TEMP_DIR}/${collector_asset}" -C "$TEMP_DIR" otelcol-contrib
+  [[ -x "${TEMP_DIR}/otelcol-contrib" ]] || fail "Collector binary missing from release archive"
+  install -d -o root -g root -m 0755 "$INSTALL_ROOT" "$INSTALL_ROOT/bin"
+  install -o root -g root -m 0755 "${TEMP_DIR}/otelcol-contrib" "$collector_binary"
+fi
 
-printf 'Downloading OpAMP Supervisor %s (%s)...\n' "$SUPERVISOR_VERSION" "$ARCH"
-download_verified "$supervisor_url" "${TEMP_DIR}/${supervisor_asset}"
+supervisor_binary="${INSTALL_ROOT}/bin/opampsupervisor"
+if [[ -x "$supervisor_binary" ]] && has_version "$supervisor_binary" "$SUPERVISOR_VERSION"; then
+  printf 'Detected OpAMP Supervisor %s already installed; keeping existing binary.\n' "$SUPERVISOR_VERSION"
+else
+  if [[ -x "$supervisor_binary" ]]; then
+    printf 'Existing Supervisor version differs from %s; updating it.\n' "$SUPERVISOR_VERSION"
+  fi
+  printf 'Downloading OpAMP Supervisor %s (%s)...\n' "$SUPERVISOR_VERSION" "$ARCH"
+  download_verified "$supervisor_url" "${TEMP_DIR}/${supervisor_asset}"
+fi
 
 if ! getent passwd "$SERVICE_USER" >/dev/null; then
   useradd --system --home-dir "$DATA_DIR" --shell /usr/sbin/nologin --user-group "$SERVICE_USER"
@@ -136,8 +164,9 @@ fi
 
 install -d -o root -g root -m 0755 "$INSTALL_ROOT" "$INSTALL_ROOT/bin" "$CONFIG_DIR"
 install -d -o "$SERVICE_USER" -g "$SERVICE_USER" -m 0750 "$DATA_DIR" "$DATA_DIR/supervisor"
-install -o root -g root -m 0755 "${TEMP_DIR}/otelcol-contrib" "${INSTALL_ROOT}/bin/otelcol-contrib"
-install -o root -g root -m 0755 "${TEMP_DIR}/${supervisor_asset}" "${INSTALL_ROOT}/bin/opampsupervisor"
+if [[ -f "${TEMP_DIR}/${supervisor_asset}" ]]; then
+  install -o root -g root -m 0755 "${TEMP_DIR}/${supervisor_asset}" "$supervisor_binary"
+fi
 
 if [[ ! -e "${CONFIG_DIR}/collector.yaml" ]]; then
   install -o root -g "$SERVICE_USER" -m 0640 "${SCRIPT_DIR}/collector.yaml" "${CONFIG_DIR}/collector.yaml"

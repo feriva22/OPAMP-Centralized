@@ -38,7 +38,11 @@ network. Use only on a trusted, isolated network, not the public internet.
 The installer downloads the binaries, creates the `opamp` system account,
 installs the Collector at `/opt/opamp/bin/otelcol-contrib`, copies the config
 files to `/etc/opamp/` (without replacing existing configs), and enables
-`opamp-supervisor.service`.
+`opamp-supervisor.service`. It detects whether either binary is already
+installed: if its reported version matches the requested version, it reuses
+that binary rather than downloading it again; otherwise it downloads and
+verifies the requested release. Existing Collector and Supervisor config files
+are preserved on reinstall.
 
 Check it with:
 
