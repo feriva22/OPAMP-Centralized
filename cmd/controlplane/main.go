@@ -172,10 +172,12 @@ CREATE TABLE IF NOT EXISTS agents (
     agent_description JSONB NOT NULL DEFAULT '{}'::jsonb,
     health JSONB NOT NULL DEFAULT '{}'::jsonb,
     effective_config JSONB NOT NULL DEFAULT '{}'::jsonb,
+    reported_config_files JSONB NOT NULL DEFAULT '{}'::jsonb,
     remote_config_status JSONB NOT NULL DEFAULT '{}'::jsonb,
     connected BOOLEAN NOT NULL DEFAULT FALSE,
     last_seen TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS reported_config_files JSONB NOT NULL DEFAULT '{}'::jsonb;
 CREATE TABLE IF NOT EXISTS config_revisions (
     id BIGSERIAL PRIMARY KEY,
     instance_uid BYTEA NOT NULL REFERENCES agents(instance_uid) ON DELETE CASCADE,
@@ -252,27 +254,58 @@ func (cp *controlPlane) saveStatus(ctx context.Context, message *protobufs.Agent
 	if err != nil {
 		return fmt.Errorf("marshal remote config status: %w", err)
 	}
+	reportedConfigFiles, err := marshalReportedConfigFiles(message.GetEffectiveConfig())
+	if err != nil {
+		return fmt.Errorf("marshal reported config files: %w", err)
+	}
 	_, err = cp.db.Exec(ctx, `
 INSERT INTO agents (
-    instance_uid, agent_description, health, effective_config, remote_config_status, connected, last_seen
-) VALUES ($1, $2::jsonb, $3::jsonb, $4::jsonb, $5::jsonb, TRUE, NOW())
+    instance_uid, agent_description, health, effective_config, reported_config_files, remote_config_status, connected, last_seen
+) VALUES ($1, COALESCE($2::jsonb, '{}'::jsonb), COALESCE($3::jsonb, '{}'::jsonb),
+          COALESCE($4::jsonb, '{}'::jsonb), COALESCE($5::jsonb, '{}'::jsonb),
+          COALESCE($6::jsonb, '{}'::jsonb), TRUE, NOW())
 ON CONFLICT (instance_uid) DO UPDATE SET
-    agent_description = EXCLUDED.agent_description,
-    health = EXCLUDED.health,
-    effective_config = EXCLUDED.effective_config,
-    remote_config_status = EXCLUDED.remote_config_status,
+    agent_description = COALESCE($2::jsonb, agents.agent_description),
+    health = COALESCE($3::jsonb, agents.health),
+    effective_config = COALESCE($4::jsonb, agents.effective_config),
+    reported_config_files = COALESCE($5::jsonb, agents.reported_config_files),
+    remote_config_status = COALESCE($6::jsonb, agents.remote_config_status),
     connected = TRUE,
     last_seen = NOW()`,
-		message.GetInstanceUid(), description, health, effectiveConfig, configStatus)
+		message.GetInstanceUid(), description, health, effectiveConfig, reportedConfigFiles, configStatus)
 	return err
 }
 
-func marshalOptional(message proto.Message) (string, error) {
+func marshalReportedConfigFiles(effectiveConfig *protobufs.EffectiveConfig) (*string, error) {
+	if effectiveConfig == nil || !effectiveConfig.ProtoReflect().IsValid() {
+		return nil, nil
+	}
+	files := make(map[string]string)
+	if effectiveConfig.GetConfigMap() != nil {
+		for name, config := range effectiveConfig.GetConfigMap().GetConfigMap() {
+			if config != nil {
+				files[name] = string(config.GetBody())
+			}
+		}
+	}
+	encoded, err := json.Marshal(files)
+	if err != nil {
+		return nil, err
+	}
+	result := string(encoded)
+	return &result, nil
+}
+
+func marshalOptional(message proto.Message) (*string, error) {
 	if message == nil || !message.ProtoReflect().IsValid() {
-		return `{}`, nil
+		return nil, nil
 	}
 	encoded, err := protojson.Marshal(message)
-	return string(encoded), err
+	if err != nil {
+		return nil, err
+	}
+	result := string(encoded)
+	return &result, nil
 }
 
 func (cp *controlPlane) onDisconnect(conn types.Connection) {
@@ -360,24 +393,38 @@ func (cp *controlPlane) adminPage(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write([]byte(`<!doctype html>
 <html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width">
 <title>OpAMP Control Plane</title>
-<style>body{font:16px system-ui;max-width:960px;margin:2rem auto;padding:0 1rem}textarea{width:100%;height:16rem}table{border-collapse:collapse;width:100%}td,th{padding:.5rem;border:1px solid #ccc;text-align:left}button{padding:.5rem}</style>
+<style>body{font:16px system-ui;max-width:1100px;margin:2rem auto;padding:0 1rem}textarea{box-sizing:border-box;width:100%;height:16rem;font:14px monospace}table{border-collapse:collapse;width:100%;display:block;overflow-x:auto}td,th{padding:.5rem;border:1px solid #ccc;text-align:left;white-space:nowrap}button{padding:.5rem;cursor:pointer}pre{white-space:pre-wrap;overflow-wrap:anywhere}.config-view{min-height:8rem;padding:1rem;background:#f4f4f4;border:1px solid #ccc}</style>
 <h1>OpAMP Control Plane (staging)</h1>
 <p>Agent authentication and TLS are not enabled. Use only on a trusted local staging host.</p>
-<button onclick="loadAgents()">Refresh agents</button><pre id="result"></pre>
-<label>Agent instance UID (hex)<input id="uid" style="display:block;width:100%"></label>
-<label>Desired Collector YAML<textarea id="config"></textarea></label>
+<button onclick="loadAgents()">Refresh agents</button><p id="error" role="alert"></p>
+<table><thead><tr><th>Instance UID</th><th>Service</th><th>Version</th><th>Connected</th><th>Last seen</th><th>Desired config</th><th>Reported config</th><th></th></tr></thead><tbody id="agents"></tbody></table>
+<h2>Selected agent</h2>
+<label>Agent instance UID<input id="uid" readonly style="display:block;width:100%"></label>
+<h3>Desired Collector YAML (editable)</h3>
+<textarea id="config" spellcheck="false"></textarea>
 <button onclick="saveConfig()">Save configuration</button>
+<h3>Effective config reported by agent</h3>
+<pre id="reported" class="config-view">Select an agent to inspect its reported effective config.</pre>
 <script>
-async function loadAgents(){const r=await fetch('/api/v1/agents');document.querySelector('#result').textContent=JSON.stringify(await r.json(),null,2)}
-async function saveConfig(){const uid=document.querySelector('#uid').value.trim();const config=document.querySelector('#config').value;const r=await fetch('/api/v1/agents/'+encodeURIComponent(uid)+'/config',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({config})});const body=await r.text();if(!r.ok)throw Error(body);alert("Configuration saved. It will be offered on the agent's next status report.")}
-loadAgents().catch(e=>document.querySelector('#result').textContent=e.message)
+const agentsBody=document.querySelector('#agents');
+const errorBox=document.querySelector('#error');
+let agentsByUID=new Map();
+function cell(row,value){const td=document.createElement('td');td.textContent=value;row.appendChild(td);return td}
+function selectAgent(uid){const agent=agentsByUID.get(uid);if(!agent)return;document.querySelector('#uid').value=uid;document.querySelector('#config').value=agent.desired_config||'';const files=agent.reported_config_files||{};const entries=Object.entries(files);document.querySelector('#reported').textContent=entries.length?entries.map(([name,content])=>(name?'# '+name+'\n':'')+content).join('\n\n'):'No effective config reported yet. Confirm the Supervisor has reports_effective_config enabled and refresh after it sends a status update.'}
+async function loadAgents(){errorBox.textContent='';const r=await fetch('/api/v1/agents');if(!r.ok)throw Error(await r.text());const agents=await r.json();agentsByUID=new Map(agents.map(agent=>[agent.instance_uid,agent]));agentsBody.replaceChildren();for(const agent of agents){const row=document.createElement('tr');cell(row,agent.instance_uid);const description=agent.agent_description||{};cell(row,description.serviceName||description.service_name||'');cell(row,description.serviceVersion||description.service_version||'');cell(row,agent.connected?'Yes':'No');cell(row,new Date(agent.last_seen).toLocaleString());cell(row,agent.desired_config?'Saved':'Not set');cell(row,Object.keys(agent.reported_config_files||{}).length?'Available':'Not reported');const action=cell(row,'');const button=document.createElement('button');button.textContent='View / edit';button.onclick=()=>selectAgent(agent.instance_uid);action.appendChild(button);agentsBody.appendChild(row)}const uid=document.querySelector('#uid').value;if(uid)selectAgent(uid)}
+async function saveConfig(){try{const uid=document.querySelector('#uid').value.trim();if(!uid)throw Error('Select an agent first.');const config=document.querySelector('#config').value;const r=await fetch('/api/v1/agents/'+encodeURIComponent(uid)+'/config',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({config})});const body=await r.text();if(!r.ok)throw Error(body);await loadAgents();alert("Configuration saved. It will be offered on the agent's next status report.")}catch(e){errorBox.textContent=e.message}}
+loadAgents().catch(e=>errorBox.textContent=e.message);
 </script></html>`))
 }
 
 func (cp *controlPlane) listAgents(w http.ResponseWriter, r *http.Request) {
 	rows, err := cp.db.Query(r.Context(), `
-SELECT encode(instance_uid, 'hex'), agent_description, health, effective_config, remote_config_status, connected, last_seen
-FROM agents ORDER BY last_seen DESC`)
+SELECT encode(a.instance_uid, 'hex'), a.agent_description, a.health, a.effective_config,
+       a.reported_config_files, a.remote_config_status, a.connected, a.last_seen,
+       COALESCE(c.config, '')
+FROM agents a
+LEFT JOIN agent_configs c ON c.instance_uid = a.instance_uid
+ORDER BY a.last_seen DESC`)
 	if err != nil {
 		http.Error(w, "could not list agents", http.StatusInternalServerError)
 		cp.logger.Printf("list agents: %v", err)
@@ -386,18 +433,20 @@ FROM agents ORDER BY last_seen DESC`)
 	defer rows.Close()
 
 	type agent struct {
-		InstanceUID        string          `json:"instance_uid"`
-		AgentDescription   json.RawMessage `json:"agent_description"`
-		Health             json.RawMessage `json:"health"`
-		EffectiveConfig    json.RawMessage `json:"effective_config"`
-		RemoteConfigStatus json.RawMessage `json:"remote_config_status"`
-		Connected          bool            `json:"connected"`
-		LastSeen           time.Time       `json:"last_seen"`
+		InstanceUID         string          `json:"instance_uid"`
+		AgentDescription    json.RawMessage `json:"agent_description"`
+		Health              json.RawMessage `json:"health"`
+		EffectiveConfig     json.RawMessage `json:"effective_config"`
+		ReportedConfigFiles json.RawMessage `json:"reported_config_files"`
+		RemoteConfigStatus  json.RawMessage `json:"remote_config_status"`
+		Connected           bool            `json:"connected"`
+		LastSeen            time.Time       `json:"last_seen"`
+		DesiredConfig       string          `json:"desired_config"`
 	}
 	agents := make([]agent, 0)
 	for rows.Next() {
 		var item agent
-		if err := rows.Scan(&item.InstanceUID, &item.AgentDescription, &item.Health, &item.EffectiveConfig, &item.RemoteConfigStatus, &item.Connected, &item.LastSeen); err != nil {
+		if err := rows.Scan(&item.InstanceUID, &item.AgentDescription, &item.Health, &item.EffectiveConfig, &item.ReportedConfigFiles, &item.RemoteConfigStatus, &item.Connected, &item.LastSeen, &item.DesiredConfig); err != nil {
 			http.Error(w, "could not read agent records", http.StatusInternalServerError)
 			cp.logger.Printf("scan agent record: %v", err)
 			return

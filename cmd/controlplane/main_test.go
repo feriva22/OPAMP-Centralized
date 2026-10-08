@@ -1,9 +1,12 @@
 package main
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+
+	"github.com/open-telemetry/opamp-go/protobufs"
 )
 
 func TestBasicAuth(t *testing.T) {
@@ -57,5 +60,55 @@ func TestDecodeUID(t *testing.T) {
 		if _, err := decodeUID(invalid); err == nil {
 			t.Errorf("decodeUID(%q) unexpectedly succeeded", invalid)
 		}
+	}
+}
+
+func TestMarshalReportedConfigFiles(t *testing.T) {
+	config, err := marshalReportedConfigFiles(&protobufs.EffectiveConfig{
+		ConfigMap: &protobufs.AgentConfigMap{
+			ConfigMap: map[string]*protobufs.AgentConfigObject{
+				"":       {Body: []byte("receivers:\n  otlp:\n")},
+				"extra":  {Body: []byte("processors:\n  batch:\n")},
+				"absent": nil,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshalReportedConfigFiles(): %v", err)
+	}
+	if config == nil {
+		t.Fatal("expected reported config files")
+	}
+
+	var files map[string]string
+	if err := json.Unmarshal([]byte(*config), &files); err != nil {
+		t.Fatalf("unmarshal config files: %v", err)
+	}
+	if got, want := files[""], "receivers:\n  otlp:\n"; got != want {
+		t.Errorf("unnamed config = %q, want %q", got, want)
+	}
+	if got, want := files["extra"], "processors:\n  batch:\n"; got != want {
+		t.Errorf("named config = %q, want %q", got, want)
+	}
+	if _, ok := files["absent"]; ok {
+		t.Error("nil config object should be omitted")
+	}
+}
+
+func TestMarshalAbsentStatusDoesNotOverwriteExistingValues(t *testing.T) {
+	description, err := marshalOptional((*protobufs.AgentDescription)(nil))
+	if err != nil {
+		t.Fatalf("marshalOptional(): %v", err)
+	}
+	if description != nil {
+		t.Fatalf("marshalOptional(nil) = %q, want nil to preserve prior report", *description)
+	}
+
+	reported, err := marshalReportedConfigFiles(nil)
+	if err != nil {
+		t.Fatalf("marshalReportedConfigFiles(nil): %v", err)
+	}
+	if reported != nil {
+		t.Fatalf("marshalReportedConfigFiles(nil) = %q, want nil to preserve prior report", *reported)
 	}
 }
