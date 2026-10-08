@@ -4,6 +4,7 @@ kind: Kustomization
 resources:
   - postgres.yaml
   - control-plane.yaml
+  - http-routes.yaml
 
 images:
   - name: ghcr.io/feriva22/opamp-centralized

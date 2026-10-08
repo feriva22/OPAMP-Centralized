@@ -5,6 +5,15 @@ PostgreSQL instance. Services are `ClusterIP` only: PostgreSQL is not exposed
 outside the namespace, and the admin UI is not published through an Ingress
 or public load balancer by default.
 
+It also creates two Gateway API `HTTPRoute` resources. They attach to the
+Gateway named `eg-observability` in namespace `eg-observability`, using the
+`http-opamp-server` listener for OpAMP port 4320 and the
+`http-opamp-server-control-panel` listener for the admin panel on port 4321.
+That Gateway must exist, have these listener names, and allow routes from the
+namespace configured in the Argo CD Application. Gateway API CRDs must be
+installed in the cluster. If your Gateway is in a different namespace or uses
+different listener names, update `http-routes.yaml`.
+
 ## Prepare the repository configuration
 
 1. Update `images` in `kustomization.yaml` with the GitHub owner/repository
@@ -74,7 +83,7 @@ kubectl -n <target-namespace> rollout status deployment/opamp-control-plane
 
 ## Agent connectivity and admin access
 
-The in-cluster OpAMP endpoint is:
+The in-cluster OpAMP endpoint, before Gateway routing, is:
 
 ```text
 ws://opamp-control-plane.<target-namespace>.svc.cluster.local:4320/v1/opamp
@@ -85,8 +94,11 @@ telemetry are not encrypted in transit. For remote VM agents, expose port 4320
 only over a trusted private network, or add and test TLS termination and
 `wss://` support before broader deployment.
 
-The admin panel is served on port 4321 and remains cluster-internal. For
-temporary access from an operator machine, use a port-forward:
+The HTTPRoutes forward each Gateway listener to its corresponding Service
+port. Configure the Gateway listeners' hostnames and DNS to get the external
+URLs. OpAMP uses WebSocket upgrades over HTTP; verify that the Gateway listener
+and any policies preserve WebSocket connections. For temporary admin access
+without using the Gateway, use a port-forward:
 
 ```sh
 kubectl -n <target-namespace> port-forward service/opamp-control-plane 4321:4321
