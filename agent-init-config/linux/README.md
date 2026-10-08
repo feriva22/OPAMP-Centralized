@@ -18,16 +18,31 @@ published with its GitHub release. Set `SUPERVISOR_VERSION` and
 
 ## Install
 
-From this directory on the VM, use the server address that the VM can reach:
+1. Create a **Bootstrap token** in the control-plane UI. Keep the page open;
+   the plaintext token is shown only once.
+2. Connect to the Debian or Ubuntu VM that will run the agent. Ensure it can
+   reach the OpAMP server and has `git`, `curl`, and `sudo`.
+3. Clone the repository and move to the Linux installer directory:
 
 ```sh
-sudo bash ./install-agent.sh "ws://10.0.0.10:4320/v1/opamp"
+git clone https://github.com/feriva22/OPAMP-Centralized.git
+cd OPAMP-Centralized/agent-init-config/linux
 ```
 
-Replace `10.0.0.10` with the reachable IP address or DNS name of the control
-plane. Before installing, create a **Bootstrap token** in the control-plane
-UI. The installer will securely prompt for the token without echoing it; do not
-append the token to the command line. The initial install writes the token as
+4. Run the installer, replacing `YOUR_OPAMP_SERVER` with the DNS name or IP
+   address reachable from the VM:
+
+```sh
+sudo bash ./install-agent.sh "ws://YOUR_OPAMP_SERVER:4320/v1/opamp"
+```
+
+Use the OpAMP WebSocket endpoint, including `/v1/opamp`, not the control-panel
+HTTP endpoint. If the OpAMP listener is published on another external host or
+port, use that reachable address instead. The installer securely prompts for
+the token without echoing it; paste the Bootstrap token from the UI and press
+Enter. Do not append the token to the command line. The initial install stores
+the token in `/etc/opamp/supervisor.yaml`, readable only by the `opamp` service
+account.
 an `Authorization: Bearer ...` header in `/etc/opamp/supervisor.yaml`.
 
 The token is bound to the first instance UID that connects. Keep the token

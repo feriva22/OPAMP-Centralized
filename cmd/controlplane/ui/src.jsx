@@ -427,6 +427,16 @@ function CredentialsPage(props) {
   return (
     <>
       <PageHeading eyebrow="ACCESS MANAGEMENT" title="Credentials" description="Issue, rotate, and revoke per-agent credentials. Secrets are stored as hashes and shown only once." />
+      <section class="panel install-guide">
+        <div class="panel-heading"><div><h2>Add a Linux agent</h2><p>Follow these steps on a Debian or Ubuntu VM with systemd.</p></div><span class="quick-icon blue">⌘</span></div>
+        <ol class="install-steps">
+          <li><strong>Create a bootstrap token</strong><span>Use the form below. Keep this page open; the token is displayed only once.</span></li>
+          <li><strong>Connect to the agent VM</strong><span>Make sure it can reach the OpAMP server and has <code>git</code>, <code>curl</code>, and <code>sudo</code>.</span></li>
+          <li><strong>Clone the installer from GitHub</strong><code class="install-command">git clone https://github.com/feriva22/OPAMP-Centralized.git<br />cd OPAMP-Centralized/agent-init-config/linux</code></li>
+          <li><strong>Run the installer with your server endpoint</strong><span>Replace <code>YOUR_OPAMP_SERVER</code> with the DNS name or IP reachable from the VM. Keep the WebSocket path and use the externally reachable port if it differs from <code>4320</code>.</span><code class="install-command">sudo bash ./install-agent.sh "ws://YOUR_OPAMP_SERVER:4320/v1/opamp"</code><span>When prompted, paste the bootstrap token from this page and press Enter. The input is hidden while you type; do not put the token in the command.</span></li>
+          <li><strong>Confirm the service is running</strong><code class="install-command">sudo systemctl status opamp-supervisor</code></li>
+        </ol>
+      </section>
       <div class="notice notice-warning"><span class="notice-icon">{icons.shield}</span><div><strong>Plaintext WebSocket transport</strong><p>Bearer credentials can be intercepted over <code>ws://</code>. Use a trusted, isolated network until TLS is enabled.</p></div></div>
       {issuedToken && <section class="token-reveal"><div class="token-reveal-head"><span class="quick-icon green">✓</span><div><strong>Credential created — copy it now</strong><small>This plaintext will not be shown again.</small></div><button class="icon-button" title="Hide token" onClick={() => setIssuedToken(null)}>×</button></div><div class="token-secret"><code>{issuedToken.token}</code><button class="button button-secondary" onClick={onCopy}>{copied ? 'Copied' : `${icons.copy} Copy token`}</button></div><div class="token-install"><small>Install command (the script securely prompts for the token)</small><code>sudo bash ./install-agent.sh "ws://SERVER_HOST:4320/v1/opamp"</code></div></section>}
       <div class="credential-layout">
