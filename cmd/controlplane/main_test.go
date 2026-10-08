@@ -5,6 +5,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/open-telemetry/opamp-go/protobufs"
@@ -61,6 +62,44 @@ func TestDecodeUID(t *testing.T) {
 		if _, err := decodeUID(invalid); err == nil {
 			t.Errorf("decodeUID(%q) unexpectedly succeeded", invalid)
 		}
+	}
+}
+
+func TestBearerToken(t *testing.T) {
+	for _, test := range []struct {
+		header string
+		want   string
+		ok     bool
+	}{
+		{header: "Bearer " + strings.Repeat("a", 43), want: strings.Repeat("a", 43), ok: true},
+		{header: "Basic abc", ok: false},
+		{header: "Bearer ", ok: false},
+		{header: "Bearer token with-space", ok: false},
+		{header: "Bearer\ttoken", ok: false},
+		{header: "Bearer too-short", ok: false},
+	} {
+		t.Run(test.header, func(t *testing.T) {
+			got, ok := bearerToken(test.header)
+			if got != test.want || ok != test.ok {
+				t.Fatalf("bearerToken(%q) = (%q, %t), want (%q, %t)", test.header, got, ok, test.want, test.ok)
+			}
+		})
+	}
+}
+
+func TestNewAgentToken(t *testing.T) {
+	token, err := newAgentToken()
+	if err != nil {
+		t.Fatalf("newAgentToken(): %v", err)
+	}
+	if len(token) != 43 || strings.ContainsAny(token, "+/=") {
+		t.Fatalf("newAgentToken() = %q, want 43-character URL-safe token", token)
+	}
+	if got := tokenHash(token); len(got) != 32 {
+		t.Fatalf("tokenHash() length = %d, want 32", len(got))
+	}
+	if string(tokenHash(token)) == token {
+		t.Fatal("tokenHash() unexpectedly returned plaintext token")
 	}
 }
 

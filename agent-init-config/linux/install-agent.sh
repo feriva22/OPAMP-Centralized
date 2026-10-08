@@ -20,7 +20,8 @@ usage() {
 Usage: sudo bash ./install-agent.sh ws://SERVER_HOST:4320/v1/opamp
 
 Installs the OpenTelemetry Collector Contrib and OpAMP Supervisor, writes
-local configs if they do not already exist, and enables the systemd service.
+local configs if they do not already exist, prompts securely for an agent
+token, and enables the systemd service.
 
 Optional environment variables:
   SUPERVISOR_VERSION  OpAMP Supervisor release version (default: 0.159.0)
@@ -52,6 +53,18 @@ fi
 
 if [[ "${EUID}" -ne 0 ]]; then
   fail "run this installer as root (for example: sudo bash ./install-agent.sh 'ws://10.0.0.10:4320/v1/opamp')"
+fi
+
+SUPERVISOR_CONFIG_CREATED=0
+if [[ ! -e "/etc/opamp/supervisor.yaml" ]]; then
+  if [[ -t 0 ]]; then
+    read -r -s -p "Paste the agent token from the control-plane UI: " OPAMP_AGENT_TOKEN
+    printf '\n'
+  else
+    read -r OPAMP_AGENT_TOKEN || fail "could not read the agent token from standard input"
+  fi
+  [[ "$OPAMP_AGENT_TOKEN" =~ ^[A-Za-z0-9_-]{43}$ ]] ||
+    fail "agent token is invalid; create/copy a token from the control-plane UI"
 fi
 
 [[ -f /etc/os-release ]] || fail "cannot identify Linux distribution"
@@ -133,8 +146,9 @@ if [[ ! -e "${CONFIG_DIR}/supervisor.yaml" ]]; then
   escaped_endpoint="${OPAMP_ENDPOINT//&/\\&}"
   escaped_endpoint="${escaped_endpoint//|/\\|}"
   escaped_endpoint="${escaped_endpoint//\\/\\\\}"
-  sed "s|__OPAMP_ENDPOINT__|${escaped_endpoint}|" "${SCRIPT_DIR}/supervisor.yaml.in" \
+  sed "s|__OPAMP_ENDPOINT__|${escaped_endpoint}|;s|__OPAMP_AGENT_TOKEN__|${OPAMP_AGENT_TOKEN}|" "${SCRIPT_DIR}/supervisor.yaml.in" \
     | install -o root -g "$SERVICE_USER" -m 0640 /dev/stdin "${CONFIG_DIR}/supervisor.yaml"
+  SUPERVISOR_CONFIG_CREATED=1
 fi
 
 "${INSTALL_ROOT}/bin/otelcol-contrib" validate --config="${CONFIG_DIR}/collector.yaml"
@@ -181,5 +195,8 @@ printf '\nInstalled and started opamp-supervisor.service.\n'
 printf 'Status:  systemctl status opamp-supervisor\n'
 printf 'Logs:    journalctl -u opamp-supervisor -f\n'
 printf 'Config:  %s/supervisor.yaml and %s/collector.yaml\n' "$CONFIG_DIR" "$CONFIG_DIR"
-printf '\nWARNING: OpAMP currently uses unencrypted ws:// and the server accepts unauthenticated agents.\n'
-printf 'Use only on a trusted private network; do not send sensitive telemetry over this connection.\n'
+printf '\nWARNING: OpAMP uses unencrypted ws://. The bearer token and telemetry can be intercepted on the network.\n'
+printf 'Use only on a trusted, isolated network; do not send sensitive telemetry over this connection.\n'
+if [[ "$SUPERVISOR_CONFIG_CREATED" -eq 0 ]]; then
+  printf 'Existing Supervisor config was preserved. If rotating a token, update its Authorization header and restart the service.\n'
+fi

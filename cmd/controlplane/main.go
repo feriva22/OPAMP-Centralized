@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -14,6 +16,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -36,12 +39,23 @@ const (
 type controlPlane struct {
 	db          *pgxpool.Pool
 	logger      *log.Logger
-	connections map[types.Connection][]byte
+	connections map[types.Connection]*agentConnection
 	connMu      sync.RWMutex
+}
+
+type agentConnection struct {
+	tokenID     int64
+	instanceUID []byte
+	mu          sync.Mutex
+	revoked     bool
 }
 
 type configRequest struct {
 	Config string `json:"config"`
+}
+
+type tokenRequest struct {
+	Name string `json:"name"`
 }
 
 type configResponse struct {
@@ -108,7 +122,7 @@ func run() error {
 	cp := &controlPlane{
 		db:          pool,
 		logger:      log.New(os.Stdout, "[control-plane] ", log.LstdFlags|log.LUTC),
-		connections: make(map[types.Connection][]byte),
+		connections: make(map[types.Connection]*agentConnection),
 	}
 
 	opampServer := server.New(nil)
@@ -117,15 +131,7 @@ func run() error {
 		Settings: server.Settings{
 			MaxMessageSize: 4 << 20,
 			Callbacks: types.Callbacks{
-				OnConnecting: func(_ *http.Request) types.ConnectionResponse {
-					return types.ConnectionResponse{
-						Accept: true,
-						ConnectionCallbacks: types.ConnectionCallbacks{
-							OnMessage:         cp.onMessage,
-							OnConnectionClose: cp.onDisconnect,
-						},
-					}
-				},
+				OnConnecting: cp.onConnecting,
 			},
 		},
 	}); err != nil {
@@ -189,6 +195,17 @@ ALTER TABLE agents ADD COLUMN IF NOT EXISTS os_type TEXT NOT NULL DEFAULT '';
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS agent_type TEXT NOT NULL DEFAULT '';
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS agent_version TEXT NOT NULL DEFAULT '';
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS source_ip TEXT NOT NULL DEFAULT '';
+CREATE TABLE IF NOT EXISTS agent_tokens (
+    id BIGSERIAL PRIMARY KEY,
+    name TEXT NOT NULL,
+    token_hash BYTEA NOT NULL UNIQUE CHECK (octet_length(token_hash) = 32),
+    instance_uid BYTEA REFERENCES agents(instance_uid) ON DELETE SET NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_used_at TIMESTAMPTZ,
+    revoked_at TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS agent_tokens_active_uid_idx
+    ON agent_tokens(instance_uid) WHERE revoked_at IS NULL;
 CREATE TABLE IF NOT EXISTS config_revisions (
     id BIGSERIAL PRIMARY KEY,
     instance_uid BYTEA NOT NULL REFERENCES agents(instance_uid) ON DELETE CASCADE,
@@ -208,7 +225,88 @@ CREATE TABLE IF NOT EXISTS agent_configs (
 	return err
 }
 
-func (cp *controlPlane) onMessage(ctx context.Context, conn types.Connection, message *protobufs.AgentToServer) *protobufs.ServerToAgent {
+func (cp *controlPlane) onConnecting(request *http.Request) types.ConnectionResponse {
+	token, ok := bearerToken(request.Header.Get("Authorization"))
+	if !ok {
+		return rejectedAgentConnection()
+	}
+	var tokenID int64
+	err := cp.db.QueryRow(request.Context(), `
+UPDATE agent_tokens SET last_used_at = NOW()
+WHERE token_hash = $1 AND revoked_at IS NULL
+RETURNING id`, tokenHash(token)).Scan(&tokenID)
+	if err != nil {
+		if !errors.Is(err, pgx.ErrNoRows) {
+			cp.logger.Printf("check agent credential: %v", err)
+		}
+		return rejectedAgentConnection()
+	}
+
+	session := &agentConnection{tokenID: tokenID}
+	return types.ConnectionResponse{
+		Accept: true,
+		ConnectionCallbacks: types.ConnectionCallbacks{
+			OnConnected: func(_ context.Context, conn types.Connection) {
+				cp.connMu.Lock()
+				var active bool
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				err := cp.db.QueryRow(ctx,
+					`SELECT EXISTS (SELECT 1 FROM agent_tokens WHERE id = $1 AND revoked_at IS NULL)`,
+					tokenID).Scan(&active)
+				cancel()
+				if err == nil && active {
+					cp.connections[conn] = session
+				}
+				cp.connMu.Unlock()
+				if err != nil || !active {
+					if err != nil {
+						cp.logger.Printf("recheck agent credential: %v", err)
+					}
+					_ = conn.Disconnect()
+				}
+			},
+			OnMessage: func(ctx context.Context, conn types.Connection, message *protobufs.AgentToServer) *protobufs.ServerToAgent {
+				return cp.onMessage(ctx, conn, session, message)
+			},
+			OnConnectionClose: cp.onDisconnect,
+		},
+	}
+}
+
+func rejectedAgentConnection() types.ConnectionResponse {
+	return types.ConnectionResponse{Accept: false, HTTPStatusCode: http.StatusUnauthorized}
+}
+
+func bearerToken(header string) (string, bool) {
+	const prefix = "Bearer "
+	if !strings.HasPrefix(header, prefix) {
+		return "", false
+	}
+	token := strings.TrimSpace(strings.TrimPrefix(header, prefix))
+	if token == "" || strings.ContainsAny(token, " \t\r\n") {
+		return "", false
+	}
+	decoded, err := base64.RawURLEncoding.DecodeString(token)
+	if err != nil || len(decoded) != 32 {
+		return "", false
+	}
+	return token, true
+}
+
+func tokenHash(token string) []byte {
+	hash := sha256.Sum256([]byte(token))
+	return hash[:]
+}
+
+func newAgentToken() (string, error) {
+	secret := make([]byte, 32)
+	if _, err := rand.Read(secret); err != nil {
+		return "", fmt.Errorf("generate agent credential: %w", err)
+	}
+	return base64.RawURLEncoding.EncodeToString(secret), nil
+}
+
+func (cp *controlPlane) onMessage(ctx context.Context, conn types.Connection, session *agentConnection, message *protobufs.AgentToServer) *protobufs.ServerToAgent {
 	response := &protobufs.ServerToAgent{
 		InstanceUid: message.GetInstanceUid(),
 		Capabilities: uint64(
@@ -219,16 +317,33 @@ func (cp *controlPlane) onMessage(ctx context.Context, conn types.Connection, me
 	}
 	if len(message.GetInstanceUid()) != 16 {
 		cp.logger.Printf("rejecting unsupported instance UID length %d", len(message.GetInstanceUid()))
+		_ = conn.Disconnect()
 		return response
 	}
 
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	if session.revoked {
+		_ = conn.Disconnect()
+		return nil
+	}
+	cp.connMu.RLock()
+	registered := cp.connections[conn] == session
+	cp.connMu.RUnlock()
+	if !registered {
+		_ = conn.Disconnect()
+		return nil
+	}
+	if err := cp.bindTokenToUID(ctx, session.tokenID, message.GetInstanceUid()); err != nil {
+		cp.logger.Printf("bind agent credential to %x: %v", message.GetInstanceUid(), err)
+		_ = conn.Disconnect()
+		return nil
+	}
+	session.instanceUID = append([]byte(nil), message.GetInstanceUid()...)
 	if err := cp.saveStatus(ctx, conn, message); err != nil {
 		cp.logger.Printf("persist status for %x: %v", message.GetInstanceUid(), err)
 		return response
 	}
-	cp.connMu.Lock()
-	cp.connections[conn] = append([]byte(nil), message.GetInstanceUid()...)
-	cp.connMu.Unlock()
 
 	config, hash, _, err := cp.desiredConfig(ctx, message.GetInstanceUid())
 	if err != nil {
@@ -246,6 +361,32 @@ func (cp *controlPlane) onMessage(ctx context.Context, conn types.Connection, me
 		}
 	}
 	return response
+}
+
+func (cp *controlPlane) bindTokenToUID(ctx context.Context, tokenID int64, instanceUID []byte) error {
+	tx, err := cp.db.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin credential binding: %w", err)
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx,
+		`INSERT INTO agents (instance_uid) VALUES ($1) ON CONFLICT (instance_uid) DO NOTHING`,
+		instanceUID); err != nil {
+		return fmt.Errorf("ensure agent before credential binding: %w", err)
+	}
+	var boundID int64
+	err = tx.QueryRow(ctx, `
+UPDATE agent_tokens SET instance_uid = COALESCE(instance_uid, $2)
+WHERE id = $1 AND revoked_at IS NULL
+  AND (instance_uid IS NULL OR instance_uid = $2)
+RETURNING id`, tokenID, instanceUID).Scan(&boundID)
+	if err != nil {
+		return fmt.Errorf("credential is revoked or bound to another instance: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit credential binding: %w", err)
+	}
+	return nil
 }
 
 func (cp *controlPlane) saveStatus(ctx context.Context, conn types.Connection, message *protobufs.AgentToServer) error {
@@ -382,11 +523,35 @@ func marshalOptional(message proto.Message) (*string, error) {
 
 func (cp *controlPlane) onDisconnect(conn types.Connection) {
 	cp.connMu.Lock()
-	instanceUID, connected := cp.connections[conn]
+	session, connected := cp.connections[conn]
 	delete(cp.connections, conn)
 	cp.connMu.Unlock()
 	if !connected {
 		return
+	}
+	session.mu.Lock()
+	instanceUID := append([]byte(nil), session.instanceUID...)
+	session.mu.Unlock()
+	if len(instanceUID) != 16 {
+		return
+	}
+	cp.markDisconnectedIfNoConnection(instanceUID)
+}
+
+func (cp *controlPlane) markDisconnectedIfNoConnection(instanceUID []byte) {
+	cp.connMu.RLock()
+	sessions := make([]*agentConnection, 0, len(cp.connections))
+	for _, session := range cp.connections {
+		sessions = append(sessions, session)
+	}
+	cp.connMu.RUnlock()
+	for _, session := range sessions {
+		session.mu.Lock()
+		active := !session.revoked && string(session.instanceUID) == string(instanceUID)
+		session.mu.Unlock()
+		if active {
+			return
+		}
 	}
 	if _, err := cp.db.Exec(context.Background(),
 		`UPDATE agents SET connected = FALSE WHERE instance_uid = $1`, instanceUID); err != nil {
@@ -426,6 +591,11 @@ func (cp *controlPlane) adminHandler(username, password string) http.Handler {
 	mux.HandleFunc("GET /api/v1/agents", cp.listAgents)
 	mux.HandleFunc("PUT /api/v1/agents/{uid}/config", cp.putConfig)
 	mux.HandleFunc("GET /api/v1/agents/{uid}/config", cp.getConfig)
+	mux.HandleFunc("POST /api/v1/agents/{uid}/token", cp.createAgentToken)
+	mux.HandleFunc("GET /api/v1/agent-tokens", cp.listAgentTokens)
+	mux.HandleFunc("POST /api/v1/agent-tokens", cp.createBootstrapToken)
+	mux.HandleFunc("POST /api/v1/agent-tokens/{id}/rotate", cp.rotateAgentToken)
+	mux.HandleFunc("DELETE /api/v1/agent-tokens/{id}", cp.revokeAgentToken)
 	protected := basicAuth(username, password, mux)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/healthz" && r.Method == http.MethodGet {
@@ -467,8 +637,15 @@ func (cp *controlPlane) adminPage(w http.ResponseWriter, r *http.Request) {
 <title>OpAMP Control Plane</title>
 <style>body{font:16px system-ui;max-width:1400px;margin:2rem auto;padding:0 1rem}textarea{box-sizing:border-box;width:100%;height:16rem;font:14px monospace}table{border-collapse:collapse;width:100%;display:block;overflow-x:auto}td,th{padding:.5rem;border:1px solid #ccc;text-align:left;white-space:nowrap}button{padding:.5rem;cursor:pointer}pre{white-space:pre-wrap;overflow-wrap:anywhere}.config-view{min-height:8rem;padding:1rem;background:#f4f4f4;border:1px solid #ccc}</style>
 <h1>OpAMP Control Plane (staging)</h1>
-<p>Agent authentication and TLS are not enabled. Use only on a trusted local staging host.</p>
-<button onclick="loadAgents()">Refresh agents</button><p id="error" role="alert"></p>
+<p>Agents require individual bearer tokens. The current OpAMP endpoint uses plaintext <code>ws://</code>; tokens can be intercepted on the network. Use only on a trusted, isolated staging network.</p>
+<button onclick="refreshAll()">Refresh</button><p id="error" role="alert"></p>
+<h2>Agent credentials</h2>
+<label>Bootstrap token label <input id="token-name" maxlength="100" value="Linux VM bootstrap"></label>
+<button onclick="createBootstrapToken()">Create bootstrap token</button>
+<p>Create a bootstrap token before installing an agent. It binds to the first agent UID that connects and cannot be reused by another UID.</p>
+<table><thead><tr><th>Label</th><th>Bound instance UID</th><th>Status</th><th>Created</th><th>Last used</th><th>Actions</th></tr></thead><tbody id="tokens"></tbody></table>
+<section id="new-token" hidden><h3>Copy this token now</h3><p>The plaintext is shown only once. Store it securely; the server keeps only its hash.</p><pre id="token-value"></pre><p>Linux install command (the installer prompts for the token):</p><pre id="install-command"></pre><button onclick="hideToken()">Hide token</button></section>
+<h2>Agents</h2>
 <table><thead><tr><th>Instance UID</th><th>Hostname</th><th>OS</th><th>Agent type</th><th>Version</th><th>Source IP</th><th>Connected</th><th>Last seen</th><th>Desired config</th><th>Reported config</th><th></th></tr></thead><tbody id="agents"></tbody></table>
 <h2>Selected agent</h2>
 <label>Agent instance UID<input id="uid" readonly style="display:block;width:100%"></label>
@@ -479,13 +656,23 @@ func (cp *controlPlane) adminPage(w http.ResponseWriter, r *http.Request) {
 <pre id="reported" class="config-view">Select an agent to inspect its reported effective config.</pre>
 <script>
 const agentsBody=document.querySelector('#agents');
+const tokensBody=document.querySelector('#tokens');
 const errorBox=document.querySelector('#error');
 let agentsByUID=new Map();
 function cell(row,value){const td=document.createElement('td');td.textContent=value;row.appendChild(td);return td}
+async function api(url,options){const r=await fetch(url,options);const body=await r.text();if(!r.ok)throw Error(body||'Request failed');return body?JSON.parse(body):null}
+function showNewToken(result){document.querySelector('#token-value').textContent=result.token;const endpoint='ws://'+location.hostname+':4320/v1/opamp';document.querySelector('#install-command').textContent='sudo bash ./install-agent.sh "'+endpoint+'"';document.querySelector('#new-token').hidden=false;document.querySelector('#new-token').scrollIntoView({behavior:'smooth'})}
+function hideToken(){document.querySelector('#token-value').textContent='';document.querySelector('#install-command').textContent='';document.querySelector('#new-token').hidden=true}
 function selectAgent(uid){const agent=agentsByUID.get(uid);if(!agent)return;document.querySelector('#uid').value=uid;document.querySelector('#config').value=agent.desired_config||'';const files=agent.reported_config_files||{};const entries=Object.entries(files);document.querySelector('#reported').textContent=entries.length?entries.map(([name,content])=>(name?'# '+name+'\n':'')+content).join('\n\n'):'No effective config reported yet. Confirm the Supervisor has reports_effective_config enabled and refresh after it sends a status update.'}
-async function loadAgents(){errorBox.textContent='';const r=await fetch('/api/v1/agents');if(!r.ok)throw Error(await r.text());const agents=await r.json();agentsByUID=new Map(agents.map(agent=>[agent.instance_uid,agent]));agentsBody.replaceChildren();for(const agent of agents){const row=document.createElement('tr');cell(row,agent.instance_uid);cell(row,agent.hostname);cell(row,agent.os_type);cell(row,agent.agent_type);cell(row,agent.agent_version);cell(row,agent.source_ip);cell(row,agent.connected?'Yes':'No');cell(row,new Date(agent.last_seen).toLocaleString());cell(row,agent.desired_config?'Saved':'Not set');cell(row,Object.keys(agent.reported_config_files||{}).length?'Available':'Not reported');const action=cell(row,'');const button=document.createElement('button');button.textContent='View / edit';button.onclick=()=>selectAgent(agent.instance_uid);action.appendChild(button);agentsBody.appendChild(row)}const uid=document.querySelector('#uid').value;if(uid)selectAgent(uid)}
+async function loadAgents(){const agents=await api('/api/v1/agents');agentsByUID=new Map(agents.map(agent=>[agent.instance_uid,agent]));agentsBody.replaceChildren();for(const agent of agents){const row=document.createElement('tr');cell(row,agent.instance_uid);cell(row,agent.hostname);cell(row,agent.os_type);cell(row,agent.agent_type);cell(row,agent.agent_version);cell(row,agent.source_ip);cell(row,agent.connected?'Yes':'No');cell(row,new Date(agent.last_seen).toLocaleString());cell(row,agent.desired_config?'Saved':'Not set');cell(row,Object.keys(agent.reported_config_files||{}).length?'Available':'Not reported');const action=cell(row,'');const button=document.createElement('button');button.textContent='View / edit';button.onclick=()=>selectAgent(agent.instance_uid);action.appendChild(button);const tokenButton=document.createElement('button');tokenButton.textContent='Issue token';tokenButton.onclick=()=>issueAgentToken(agent.instance_uid,agent.hostname);action.appendChild(document.createTextNode(' '));action.appendChild(tokenButton);agentsBody.appendChild(row)}const uid=document.querySelector('#uid').value;if(uid)selectAgent(uid)}
+async function loadTokens(){const tokens=await api('/api/v1/agent-tokens');tokensBody.replaceChildren();for(const token of tokens){const row=document.createElement('tr');cell(row,token.name);cell(row,token.instance_uid||'Unbound (awaiting first connection)');cell(row,token.revoked_at?'Revoked':'Active');cell(row,new Date(token.created_at).toLocaleString());cell(row,token.last_used_at?new Date(token.last_used_at).toLocaleString():'Never');const action=cell(row,'');if(!token.revoked_at){const rotate=document.createElement('button');rotate.textContent='Rotate';rotate.onclick=()=>rotateToken(token.id);action.appendChild(rotate);const revoke=document.createElement('button');revoke.textContent='Revoke';revoke.onclick=()=>revokeToken(token.id);action.appendChild(document.createTextNode(' '));action.appendChild(revoke)}tokensBody.appendChild(row)}}
+async function refreshAll(){try{errorBox.textContent='';await Promise.all([loadAgents(),loadTokens()])}catch(e){errorBox.textContent=e.message}}
+async function createBootstrapToken(){try{const result=await api('/api/v1/agent-tokens',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:document.querySelector('#token-name').value})});showNewToken(result);await refreshAll()}catch(e){errorBox.textContent=e.message}}
+async function issueAgentToken(uid,hostname){try{const result=await api('/api/v1/agents/'+encodeURIComponent(uid)+'/token',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:'Agent '+(hostname||uid)})});showNewToken(result);await refreshAll()}catch(e){errorBox.textContent=e.message}}
+async function rotateToken(id){if(!confirm('Revoke this token and issue its replacement? The current connection will be disconnected.'))return;try{const result=await api('/api/v1/agent-tokens/'+id+'/rotate',{method:'POST'});showNewToken(result);await refreshAll()}catch(e){errorBox.textContent=e.message}}
+async function revokeToken(id){if(!confirm('Revoke this token and disconnect its active agent?'))return;try{await api('/api/v1/agent-tokens/'+id,{method:'DELETE'});hideToken();await refreshAll()}catch(e){errorBox.textContent=e.message}}
 async function saveConfig(){try{const uid=document.querySelector('#uid').value.trim();if(!uid)throw Error('Select an agent first.');const config=document.querySelector('#config').value;const r=await fetch('/api/v1/agents/'+encodeURIComponent(uid)+'/config',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({config})});const body=await r.text();if(!r.ok)throw Error(body);await loadAgents();alert("Configuration saved. It will be offered on the agent's next status report.")}catch(e){errorBox.textContent=e.message}}
-loadAgents().catch(e=>errorBox.textContent=e.message);
+refreshAll();
 </script></html>`))
 }
 
@@ -536,6 +723,261 @@ ORDER BY a.last_seen DESC`)
 		return
 	}
 	writeJSON(w, http.StatusOK, agents)
+}
+
+type agentTokenResponse struct {
+	ID          int64     `json:"id"`
+	Name        string    `json:"name"`
+	Token       string    `json:"token,omitempty"`
+	InstanceUID string    `json:"instance_uid,omitempty"`
+	CreatedAt   time.Time `json:"created_at,omitempty"`
+	LastUsedAt  string    `json:"last_used_at,omitempty"`
+	RevokedAt   string    `json:"revoked_at,omitempty"`
+}
+
+func (cp *controlPlane) listAgentTokens(w http.ResponseWriter, r *http.Request) {
+	rows, err := cp.db.Query(r.Context(), `
+SELECT id, name, COALESCE(encode(instance_uid, 'hex'), ''),
+       to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'),
+       COALESCE(to_char(last_used_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'), ''),
+       COALESCE(to_char(revoked_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'), '')
+FROM agent_tokens
+ORDER BY created_at DESC, id DESC`)
+	if err != nil {
+		http.Error(w, "could not list agent credentials", http.StatusInternalServerError)
+		cp.logger.Printf("list agent credentials: %v", err)
+		return
+	}
+	defer rows.Close()
+	tokens := make([]agentTokenResponse, 0)
+	for rows.Next() {
+		var token agentTokenResponse
+		var createdAt string
+		if err := rows.Scan(&token.ID, &token.Name, &token.InstanceUID, &createdAt, &token.LastUsedAt, &token.RevokedAt); err != nil {
+			http.Error(w, "could not read agent credentials", http.StatusInternalServerError)
+			cp.logger.Printf("scan agent credential: %v", err)
+			return
+		}
+		token.CreatedAt, err = time.Parse("2006-01-02T15:04:05.999999Z", createdAt)
+		if err != nil {
+			http.Error(w, "could not read agent credentials", http.StatusInternalServerError)
+			cp.logger.Printf("parse agent credential timestamp: %v", err)
+			return
+		}
+		tokens = append(tokens, token)
+	}
+	if err := rows.Err(); err != nil {
+		http.Error(w, "could not read agent credentials", http.StatusInternalServerError)
+		cp.logger.Printf("iterate agent credentials: %v", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, tokens)
+}
+
+func decodeTokenRequest(w http.ResponseWriter, r *http.Request) (tokenRequest, error) {
+	r.Body = http.MaxBytesReader(w, r.Body, 4096)
+	var input tokenRequest
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&input); err != nil {
+		return input, err
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return input, errors.New("request must contain exactly one JSON object")
+	}
+	input.Name = strings.TrimSpace(input.Name)
+	if input.Name == "" || len(input.Name) > 100 {
+		return input, errors.New("credential name must be between 1 and 100 characters")
+	}
+	return input, nil
+}
+
+func (cp *controlPlane) createBootstrapToken(w http.ResponseWriter, r *http.Request) {
+	input, err := decodeTokenRequest(w, r)
+	if err != nil {
+		http.Error(w, "invalid credential request: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	cp.createTokenResponse(w, r, input.Name, nil)
+}
+
+func (cp *controlPlane) createAgentToken(w http.ResponseWriter, r *http.Request) {
+	instanceUID, err := decodeUID(r.PathValue("uid"))
+	if err != nil {
+		http.Error(w, "instance UID must be 32 hexadecimal characters", http.StatusBadRequest)
+		return
+	}
+	input, err := decodeTokenRequest(w, r)
+	if err != nil {
+		http.Error(w, "invalid credential request: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	cp.createTokenResponse(w, r, input.Name, instanceUID)
+}
+
+func (cp *controlPlane) createTokenResponse(w http.ResponseWriter, r *http.Request, name string, instanceUID []byte) {
+	token, err := newAgentToken()
+	if err != nil {
+		http.Error(w, "could not create agent credential", http.StatusInternalServerError)
+		cp.logger.Printf("generate agent credential: %v", err)
+		return
+	}
+	ctx := r.Context()
+	tx, err := cp.db.Begin(ctx)
+	if err != nil {
+		http.Error(w, "could not create agent credential", http.StatusInternalServerError)
+		cp.logger.Printf("begin credential transaction: %v", err)
+		return
+	}
+	defer tx.Rollback(ctx)
+	if instanceUID != nil {
+		if _, err := tx.Exec(ctx, `INSERT INTO agents (instance_uid) VALUES ($1) ON CONFLICT (instance_uid) DO NOTHING`, instanceUID); err != nil {
+			http.Error(w, "could not create agent credential", http.StatusInternalServerError)
+			cp.logger.Printf("ensure agent for credential: %v", err)
+			return
+		}
+	}
+	var result agentTokenResponse
+	result.Name = name
+	result.Token = token
+	if instanceUID != nil {
+		result.InstanceUID = hex.EncodeToString(instanceUID)
+	}
+	err = tx.QueryRow(ctx, `
+INSERT INTO agent_tokens (name, token_hash, instance_uid)
+VALUES ($1, $2, $3)
+RETURNING id, created_at`, name, tokenHash(token), instanceUID).Scan(&result.ID, &result.CreatedAt)
+	if err != nil {
+		http.Error(w, "could not create agent credential", http.StatusInternalServerError)
+		cp.logger.Printf("insert agent credential: %v", err)
+		return
+	}
+	if err := tx.Commit(ctx); err != nil {
+		http.Error(w, "could not create agent credential", http.StatusInternalServerError)
+		cp.logger.Printf("commit agent credential: %v", err)
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, http.StatusCreated, result)
+}
+
+func parseTokenID(value string) (int64, error) {
+	id, err := strconv.ParseInt(value, 10, 64)
+	if err != nil || id < 1 {
+		return 0, errors.New("invalid credential ID")
+	}
+	return id, nil
+}
+
+func (cp *controlPlane) rotateAgentToken(w http.ResponseWriter, r *http.Request) {
+	tokenID, err := parseTokenID(r.PathValue("id"))
+	if err != nil {
+		http.Error(w, "credential ID must be a positive integer", http.StatusBadRequest)
+		return
+	}
+	token, err := newAgentToken()
+	if err != nil {
+		http.Error(w, "could not rotate agent credential", http.StatusInternalServerError)
+		cp.logger.Printf("generate rotated credential: %v", err)
+		return
+	}
+	ctx := r.Context()
+	tx, err := cp.db.Begin(ctx)
+	if err != nil {
+		http.Error(w, "could not rotate agent credential", http.StatusInternalServerError)
+		cp.logger.Printf("begin credential rotation: %v", err)
+		return
+	}
+	defer tx.Rollback(ctx)
+	var result agentTokenResponse
+	var instanceUID []byte
+	err = tx.QueryRow(ctx, `
+SELECT name, instance_uid FROM agent_tokens
+WHERE id = $1 AND revoked_at IS NULL FOR UPDATE`, tokenID).Scan(&result.Name, &instanceUID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		http.Error(w, "active credential not found", http.StatusNotFound)
+		return
+	}
+	if err != nil {
+		http.Error(w, "could not rotate agent credential", http.StatusInternalServerError)
+		cp.logger.Printf("read credential for rotation: %v", err)
+		return
+	}
+	if _, err := tx.Exec(ctx, `UPDATE agent_tokens SET revoked_at = NOW() WHERE id = $1`, tokenID); err != nil {
+		http.Error(w, "could not rotate agent credential", http.StatusInternalServerError)
+		cp.logger.Printf("revoke rotated credential: %v", err)
+		return
+	}
+	if instanceUID != nil {
+		result.InstanceUID = hex.EncodeToString(instanceUID)
+	}
+	result.Token = token
+	err = tx.QueryRow(ctx, `
+INSERT INTO agent_tokens (name, token_hash, instance_uid)
+VALUES ($1, $2, $3)
+RETURNING id, created_at`, result.Name, tokenHash(token), instanceUID).Scan(&result.ID, &result.CreatedAt)
+	if err != nil {
+		http.Error(w, "could not rotate agent credential", http.StatusInternalServerError)
+		cp.logger.Printf("insert rotated credential: %v", err)
+		return
+	}
+	if err := tx.Commit(ctx); err != nil {
+		http.Error(w, "could not rotate agent credential", http.StatusInternalServerError)
+		cp.logger.Printf("commit credential rotation: %v", err)
+		return
+	}
+	cp.disconnectCredential(tokenID, instanceUID)
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, http.StatusCreated, result)
+}
+
+func (cp *controlPlane) revokeAgentToken(w http.ResponseWriter, r *http.Request) {
+	tokenID, err := parseTokenID(r.PathValue("id"))
+	if err != nil {
+		http.Error(w, "credential ID must be a positive integer", http.StatusBadRequest)
+		return
+	}
+	var instanceUID []byte
+	err = cp.db.QueryRow(r.Context(), `
+UPDATE agent_tokens SET revoked_at = NOW()
+WHERE id = $1 AND revoked_at IS NULL
+RETURNING instance_uid`, tokenID).Scan(&instanceUID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		http.Error(w, "active credential not found", http.StatusNotFound)
+		return
+	}
+	if err != nil {
+		http.Error(w, "could not revoke agent credential", http.StatusInternalServerError)
+		cp.logger.Printf("revoke agent credential: %v", err)
+		return
+	}
+	cp.disconnectCredential(tokenID, instanceUID)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (cp *controlPlane) disconnectCredential(tokenID int64, instanceUID []byte) {
+	cp.connMu.Lock()
+	type revokedConnection struct {
+		conn    types.Connection
+		session *agentConnection
+	}
+	var connections []revokedConnection
+	for conn, session := range cp.connections {
+		if session.tokenID == tokenID {
+			delete(cp.connections, conn)
+			connections = append(connections, revokedConnection{conn: conn, session: session})
+		}
+	}
+	cp.connMu.Unlock()
+	for _, connection := range connections {
+		connection.session.mu.Lock()
+		connection.session.revoked = true
+		connection.session.mu.Unlock()
+		_ = connection.conn.Disconnect()
+	}
+	if len(instanceUID) == 16 {
+		cp.markDisconnectedIfNoConnection(instanceUID)
+	}
 }
 
 func (cp *controlPlane) putConfig(w http.ResponseWriter, r *http.Request) {

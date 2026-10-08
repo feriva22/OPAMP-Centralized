@@ -25,9 +25,15 @@ sudo bash ./install-agent.sh "ws://10.0.0.10:4320/v1/opamp"
 ```
 
 Replace `10.0.0.10` with the reachable IP address or DNS name of the control
-plane. The current Compose deployment binds OpAMP to `127.0.0.1`, so a separate
-VM cannot connect to it unless the server is deliberately made reachable on a
-private network. Do not publish it to the public internet.
+plane. Before installing, create a **Bootstrap token** in the control-plane
+UI. The installer will securely prompt for the token without echoing it; do not
+append the token to the command line. The initial install writes the token as
+an `Authorization: Bearer ...` header in `/etc/opamp/supervisor.yaml`.
+
+The token is bound to the first instance UID that connects. Keep the token
+private: although it is stored as a hash on the server, the current OpAMP
+transport is plaintext `ws://` and the credential can be intercepted on the
+network. Use only on a trusted, isolated network, not the public internet.
 
 The installer downloads the binaries, creates the `opamp` system account,
 installs the Collector at `/opt/opamp/bin/otelcol-contrib`, copies the config
@@ -46,15 +52,37 @@ the `debug` exporter (the service journal). Replace its exporter/pipeline with
 your telemetry backend settings before rolling out to real VMs. The control
 plane can then offer per-agent remote Collector configuration.
 
+## Credential rotation and revocation
+
+Use **Rotate** or **Revoke** in the control-plane UI. Rotation revokes the old
+token immediately and disconnects the VM, then displays the replacement only
+once. Update the `Authorization` header in `/etc/opamp/supervisor.yaml`:
+
+```yaml
+server:
+  endpoint: "ws://10.0.0.10:4320/v1/opamp"
+  headers:
+    Authorization: "Bearer REPLACE_WITH_NEW_TOKEN"
+```
+
+Then restart and check the service:
+
+```sh
+sudo systemctl restart opamp-supervisor
+sudo journalctl -u opamp-supervisor -f
+```
+
+The installer preserves an existing Supervisor config, so it does not
+overwrite tokens or local settings during a reinstall. The config is installed
+root-owned with mode `0640`, readable by the `opamp` service account.
+
 ## Security warning
 
-The current control-plane OpAMP endpoint uses plaintext `ws://` and accepts
-agents without authentication. The script intentionally configures that
-staging behavior; it is not suitable for an untrusted network or sensitive
-telemetry. Before deploying beyond a trusted, isolated test network, add TLS
-(`wss://`) and per-agent authentication to the server, issue/rotate individual
-agent credentials, and update the Supervisor config to use TLS and those
-credentials. Do not put shared secrets in this repository.
+Agent authentication is enabled, but the staging OpAMP endpoint still uses
+plaintext `ws://`; bearer tokens and telemetry are not encrypted in transit.
+Before any production use, enable and verify `wss://` on the OpAMP listener and
+protect the operator UI/API with TLS and stronger operator authentication. Do
+not put real tokens in this repository.
 
 For server-side configuration and remaining production gaps, see the main
 [project README](../../README.md).

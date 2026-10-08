@@ -1,5 +1,7 @@
 server:
   endpoint: "__OPAMP_ENDPOINT__"
+  headers:
+    Authorization: "Bearer __OPAMP_AGENT_TOKEN__"
 
 capabilities:
   reports_effective_config: true
