@@ -1,0 +1,109 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: opamp-control-plane
+  labels:
+    app.kubernetes.io/name: opamp-control-plane
+    app.kubernetes.io/part-of: opamp-control-plane
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: opamp-control-plane
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: opamp-control-plane
+        app.kubernetes.io/part-of: opamp-control-plane
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: control-plane
+          image: ghcr.io/feriva22/opamp-centralized:latest
+          imagePullPolicy: Always
+          ports:
+            - name: opamp
+              containerPort: 4320
+              protocol: TCP
+            - name: admin
+              containerPort: 4321
+              protocol: TCP
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: opamp-secrets
+                  key: DATABASE_URL
+            - name: OPAMP_ADMIN_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: opamp-secrets
+                  key: OPAMP_ADMIN_USERNAME
+            - name: OPAMP_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: opamp-secrets
+                  key: OPAMP_ADMIN_PASSWORD
+          startupProbe:
+            tcpSocket:
+              port: admin
+            periodSeconds: 5
+            failureThreshold: 24
+          livenessProbe:
+            tcpSocket:
+              port: admin
+            periodSeconds: 20
+            timeoutSeconds: 3
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: admin
+            periodSeconds: 10
+            timeoutSeconds: 3
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 32Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: opamp-control-plane
+  labels:
+    app.kubernetes.io/name: opamp-control-plane
+    app.kubernetes.io/part-of: opamp-control-plane
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: opamp-control-plane
+  ports:
+    - name: opamp
+      port: 4320
+      targetPort: opamp
+      protocol: TCP
+    - name: admin
+      port: 4321
+      targetPort: admin
+      protocol: TCP

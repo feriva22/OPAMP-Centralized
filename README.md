@@ -58,6 +58,13 @@ docker compose up -d --no-build opamp-server
 The default Compose behavior remains a local source build tagged
 `opamp-control-plane:local`.
 
+## Kubernetes / Argo CD
+
+Kustomize manifests for the control plane and PostgreSQL, plus an Argo CD
+Application template, are in [deploy/k8s](deploy/k8s/README.md). Configure the
+GHCR image name and provide the required Kubernetes Secret outside Git before
+syncing the Application.
+
 ## Features
 
 - Persists agent UID, description, health, effective config, remote-config
