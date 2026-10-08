@@ -434,6 +434,10 @@ function CredentialsPage(props) {
           <li><strong>Connect to the agent VM</strong><span>Make sure it can reach the OpAMP server and has <code>git</code>, <code>curl</code>, and <code>sudo</code>.</span></li>
           <li><strong>Clone the installer from GitHub</strong><code class="install-command">git clone https://github.com/feriva22/OPAMP-Centralized.git<br />cd OPAMP-Centralized/agent-init-config/linux</code></li>
           <li><strong>Run the installer with your server endpoint</strong><span>Replace <code>YOUR_OPAMP_SERVER</code> with the DNS name or IP reachable from the VM. Keep the WebSocket path and use the externally reachable port if it differs from <code>4320</code>.</span><code class="install-command">sudo bash ./install-agent.sh "ws://YOUR_OPAMP_SERVER:4320/v1/opamp"</code><span>When prompted, paste the bootstrap token from this page and press Enter. The input is hidden while you type; do not put the token in the command.</span></li>
+          <li><strong>Know where and how the token is stored</strong><span>On the agent VM, it is stored in <code>/etc/opamp/supervisor.yaml</code> as <code>server.headers.Authorization</code>. The file is owned by <code>root:opamp</code> with mode <code>0640</code>.</span><pre class="install-example">{`server:
+  endpoint: "ws://YOUR_OPAMP_SERVER:4320/v1/opamp"
+  headers:
+    Authorization: "<TOKEN_SHOWN_ONCE>"`}</pre><span><code>&lt;TOKEN_SHOWN_ONCE&gt;</code> is a placeholder; the installer writes the real token when you paste it at the hidden prompt. On the control plane, PostgreSQL stores a 32-byte SHA-256 hash in <code>agent_tokens.token_hash</code>, not the plaintext. The plaintext is shown only once and cannot be recovered from the server.</span></li>
           <li><strong>Confirm the service is running</strong><code class="install-command">sudo systemctl status opamp-supervisor</code></li>
         </ol>
       </section>

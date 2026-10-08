@@ -93,8 +93,11 @@ or Ubuntu VMs with the installer in
 [agent-init-config/linux](agent-init-config/linux/README.md). It uses the
 plaintext staging endpoint; the VM must be able to reach the server. Create a
 bootstrap credential in the UI before installing. The installer prompts for
-the token without echoing it and writes it to the root-owned Supervisor config,
-readable only by the `opamp` service account.
+the token without echoing it and writes it to
+`/etc/opamp/supervisor.yaml` as `server.headers.Authorization`. The file is
+owned by `root:opamp` with mode `0640`. The control plane stores only a hash of
+the token in PostgreSQL; the plaintext is shown only once in the UI and is not
+recoverable from the server.
 
 Tokens are displayed only once. A bootstrap token is initially unbound and is
 locked to the first instance UID that uses it; subsequent use by a different

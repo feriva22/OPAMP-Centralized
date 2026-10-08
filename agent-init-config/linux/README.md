@@ -41,14 +41,30 @@ HTTP endpoint. If the OpAMP listener is published on another external host or
 port, use that reachable address instead. The installer securely prompts for
 the token without echoing it; paste the Bootstrap token from the UI and press
 Enter. Do not append the token to the command line. The initial install stores
-the token in `/etc/opamp/supervisor.yaml`, readable only by the `opamp` service
-account.
-an `Authorization: Bearer ...` header in `/etc/opamp/supervisor.yaml`.
+the token in `/etc/opamp/supervisor.yaml` as the Supervisor's
+`server.headers.Authorization` value. The file is owned by `root:opamp` with
+mode `0640` (root read/write and `opamp` group read).
+
+The resulting Supervisor config has this structure. The token below is a
+placeholder, not a real credential:
+
+```yaml
+server:
+  endpoint: "ws://YOUR_OPAMP_SERVER:4320/v1/opamp"
+  headers:
+    Authorization: "<TOKEN_SHOWN_ONCE>"
+```
+
+The control plane stores the SHA-256 digest in PostgreSQL as a 32-byte binary
+value in `agent_tokens.token_hash`. It does not store this plaintext config
+value and cannot reveal it again.
 
 The token is bound to the first instance UID that connects. Keep the token
-private: although it is stored as a hash on the server, the current OpAMP
-transport is plaintext `ws://` and the credential can be intercepted on the
-network. Use only on a trusted, isolated network, not the public internet.
+private: the control plane stores only a token hash in PostgreSQL, but the
+agent needs the plaintext token in its protected Supervisor config to
+authenticate. The current OpAMP transport is plaintext `ws://`, so the
+credential can also be intercepted on the network. Use only on a trusted,
+isolated network, not the public internet.
 
 The installer downloads the binaries, creates the `opamp` system account,
 installs the Collector at `/opt/opamp/bin/otelcol-contrib`, copies the config
